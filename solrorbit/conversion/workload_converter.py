@@ -585,6 +585,14 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
         if "type" in op and op.get("type") == op_type:
             op["type"] = new_type
 
+    # A search that walks pages is a paginated-search in Solr, not a search: the "pages" and
+    # "results-per-page" parameters say how far it walks, and a plain search ignores them, turning a
+    # 25-page walk into a single request that measures something else entirely.
+    if op.get("operation-type") == "search" and ("pages" in op or "results-per-page" in op):
+        op["operation-type"] = "paginated-search"
+        if op.get("type") == "search":
+            op["type"] = "paginated-search"
+
     # Rename index → collection
     if "index" in op:
         op["collection"] = op.pop("index")
@@ -604,10 +612,19 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
     if op_type == "force-merge" and "max-num-segments" in op:
         op["max-segments"] = op.pop("max-num-segments")
 
-    # Translate search body from OpenSearch DSL to Solr JSON DSL
+    # Translate search body from OpenSearch DSL to Solr JSON DSL.
+    #
+    # An aggregation-only body carries no "query" at all - {"size": 0, "aggs": {...}} - so keying the
+    # translation on a dict "query" left such bodies in OpenSearch syntax, where "size" and "aggs"
+    # mean nothing to Solr. The operation then loads and answers, with the aggregation silently
+    # absent. Translate whenever there is anything to translate.
     if op_type in ("search", "paginated-search", "scroll-search"):
         body = op.get("body")
-        if isinstance(body, dict) and isinstance(body.get("query"), dict):
+        translatable = isinstance(body, dict) and (
+            isinstance(body.get("query"), dict)
+            or "aggs" in body or "aggregations" in body
+            or "size" in body or "sort" in body)
+        if translatable:
             try:
                 op["body"] = translate_to_solr_json_dsl(body)
             except Exception as exc:

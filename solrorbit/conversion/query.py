@@ -366,14 +366,66 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
 
     aggs = body.get("aggs") or body.get("aggregations")
     if aggs and isinstance(aggs, dict):
-        facets = _convert_aggregations_to_facets(aggs)
+        facets = _convert_aggregations_to_facets(aggs, _date_bounds_from_query(body))
         if facets:
             result["facet"] = facets
 
     return result
 
 
-def _convert_aggregations_to_facets(aggs: dict) -> dict:
+def _date_bounds_from_query(body: dict) -> tuple:
+    """
+    The start and end a date range facet should span, taken from the operation's own query.
+
+    Solr range facets need explicit bounds; OpenSearch date_histogram derives them from the data. If
+    the operation filters on the same field it aggregates, those bounds are the right ones and they
+    are exact. Otherwise there is nothing in the operation to derive them from, and a guess is
+    dangerous rather than merely imprecise: bounds that miss the data produce an empty facet, and an
+    empty facet looks like a working operation.
+    """
+    query = body.get("query") if isinstance(body, dict) else None
+    if not isinstance(query, dict):
+        return None, None
+    # walk bool wrappers to find a range clause
+    def find_range(node):
+        if not isinstance(node, dict):
+            return None
+        if "range" in node and isinstance(node["range"], dict):
+            return node["range"]
+        for key in ("bool", "filter", "must", "query"):
+            child = node.get(key)
+            if isinstance(child, dict):
+                found = find_range(child)
+                if found:
+                    return found
+            elif isinstance(child, list):
+                for item in child:
+                    found = find_range(item)
+                    if found:
+                        return found
+        return None
+
+    ranges = find_range(query)
+    if not ranges:
+        return None, None
+    for field, spec in ranges.items():
+        if not isinstance(spec, dict):
+            continue
+        lower = spec.get("gte") or spec.get("gt")
+        upper = spec.get("lte") or spec.get("lt")
+        if lower and upper:
+            return _to_solr_date(lower), _to_solr_date(upper)
+    return None, None
+
+
+def _to_solr_date(value):
+    """A Solr date literal from an OpenSearch one: a space-separated timestamp becomes ISO-8601."""
+    if isinstance(value, str) and len(value) == 19 and value[10] == " ":
+        return value.replace(" ", "T") + "Z"
+    return value
+
+
+def _convert_aggregations_to_facets(aggs: dict, date_bounds: tuple = None) -> dict:
     """
     Convert OpenSearch aggregations to Solr JSON Facet API format.
 
@@ -403,14 +455,14 @@ def _convert_aggregations_to_facets(aggs: dict) -> dict:
     for agg_name, agg_def in aggs.items():
         if not isinstance(agg_def, dict):
             continue
-        entry = _convert_single_agg(agg_name, agg_def)
+        entry = _convert_single_agg(agg_name, agg_def, date_bounds)
         if entry is not None:
             result[agg_name] = entry
 
     return result
 
 
-def _convert_single_agg(agg_name: str, agg_def: dict):
+def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None):
     """Convert a single named OpenSearch aggregation to a Solr facet entry."""
     # --- bucket aggregations ---
     if "terms" in agg_def:
@@ -426,7 +478,7 @@ def _convert_single_agg(agg_name: str, agg_def: dict):
         }
         nested = agg_def.get("aggs") or agg_def.get("aggregations")
         if nested:
-            sub = _convert_aggregations_to_facets(nested)
+            sub = _convert_aggregations_to_facets(nested, date_bounds)
             if sub:
                 facet_def["facet"] = sub
         return facet_def
@@ -443,17 +495,27 @@ def _convert_single_agg(agg_name: str, agg_def: dict):
             or dh_conf.get("interval", "month")
         )
         gap = _calendar_interval_to_solr_gap(interval)
+        start, end = (date_bounds[0], date_bounds[1]) if date_bounds else (None, None)
+        if not start or not end:
+            # A guess here is worse than an obvious placeholder: bounds that miss the corpus give an
+            # empty facet, which reads as a working operation. pmc's data is 2010-2016 and the old
+            # default spanned 2016-2027, so the facet returned almost nothing.
+            logger.warning(
+                "date_histogram agg '%s' has no date range in its query; emitting placeholder "
+                "start/end that MUST be set to the corpus range before the operation is used",
+                agg_name)
+            start, end = "REPLACE_WITH_CORPUS_START", "REPLACE_WITH_CORPUS_END"
         facet_def = {
             "type": "range",
             "field": field,
             "gap": gap,
             "mincount": 1,
-            "start": "NOW/YEAR-10YEAR",
-            "end": "NOW/YEAR+1YEAR",
+            "start": start,
+            "end": end,
         }
         nested = agg_def.get("aggs") or agg_def.get("aggregations")
         if nested:
-            sub = _convert_aggregations_to_facets(nested)
+            sub = _convert_aggregations_to_facets(nested, date_bounds)
             if sub:
                 facet_def["facet"] = sub
         return facet_def
