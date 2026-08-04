@@ -154,6 +154,30 @@ class TestConvertOpensearchWorkload(unittest.TestCase):
             self.assertEqual(10, body["limit"])
 
     def test_unsupported_ops_are_skipped(self):
+        # create-snapshot used to be listed here; Solr has a runner for it now, so an operation with
+        # no Solr equivalent at all is needed to exercise the skip.
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            self._make_source_workload(src, {
+                "indices": [],
+                "challenges": [
+                    {
+                        "name": "default",
+                        "schedule": [
+                            {
+                                "operation": {
+                                    "name": "settings",
+                                    "operation-type": "put-settings",
+                                }
+                            }
+                        ],
+                    }
+                ],
+            })
+            result = convert_opensearch_workload(src, dst)
+            self.assertIn("settings", result["skipped"])
+
+    def test_backup_operations_are_converted_rather_than_skipped(self):
+        # They have runners, so skipping them would drop a snapshot workload's whole point.
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
             self._make_source_workload(src, {
                 "indices": [],
@@ -172,7 +196,7 @@ class TestConvertOpensearchWorkload(unittest.TestCase):
                 ],
             })
             result = convert_opensearch_workload(src, dst)
-            self.assertIn("snap", result["skipped"])
+            self.assertNotIn("snap", result["skipped"])
 
     def test_writes_converted_marker(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:

@@ -87,7 +87,15 @@ def _jinja_substitute(text: str):
             tokens.append((m.group(0), False))
         return f'"__J_{idx}__"'
 
-    return _JINJA_RE.sub(replacer, text), tokens
+    modified = _JINJA_RE.sub(replacer, text)
+    # A block tag is not an array element, so the source has no comma after it: an upstream procedure
+    # writes {% with ... %} on its own line between two entries. Once each tag becomes a placeholder
+    # string, that reads as two values with nothing between them and the fragment will not parse -
+    # which is how pmc's default procedure came out copied verbatim, put-settings and all. Insert the
+    # separator the placeholders need; _jinja_restore drops it again with the placeholder.
+    # Mark the inserted separator so restore removes exactly the ones it added, and no real comma.
+    modified = re.sub(r'"(__J_\d+__)"(\s*)(?=["{\[])', r'"\1_SEP"\2, ', modified)
+    return modified, tokens
 
 
 def _jinja_restore(json_text: str, tokens: list) -> str:
@@ -99,13 +107,18 @@ def _jinja_restore(json_text: str, tokens: list) -> str:
     - For ``was_quoted=False`` tokens the placeholder string (with its
       surrounding quotes) is replaced verbatim with the original Jinja2 source.
     """
+    # The separator marker is dropped wholesale: it never belonged to the workload.
     for idx, (original, was_quoted) in enumerate(tokens):
+        # A tag that had no comma in the source got one so the fragment would parse as an array; its
+        # placeholder carries a _SEP suffix, and both the suffix and the comma go away here.
+        json_text = json_text.replace(f'"__J_{idx}___SEP",', f'"__J_{idx}__"')
+        json_text = json_text.replace(f'"__J_{idx}___SEP"', f'"__J_{idx}__"')
         placeholder_json = f'"__J_{idx}__"'
         if was_quoted:
             # Was "{{expr}}" — restore with surrounding quotes
             json_text = json_text.replace(placeholder_json, f'"{original}"')
         else:
-            # Was bare {{expr}} or {%…%} — replace the entire quoted placeholder
+            # Was bare {{expr}} or {%…%} — replace the entire quoted placeholder.
             json_text = json_text.replace(placeholder_json, original)
     return json_text
 
@@ -172,10 +185,55 @@ def _load_workload_json(workload_path: str) -> dict:
             f"Cannot parse workload file '{workload_path}' as JSON or Jinja2 template: {exc}"
         ) from exc
 
+def _convert_workload_py(source_dir: str, output_dir: str, issues: list):
+    """
+    Carry over a workload's Python module, minus anything that only makes sense for OpenSearch.
+
+    An upstream workload.py does two unrelated things: it registers runners for OpenSearch-only
+    operations - importing osbenchmark to do so, which makes the converted workload unloadable - and
+    it defines param sources that build a query in Python. The second is worth keeping and cannot be
+    translated automatically, so it is copied with a header saying what to check; the first is
+    dropped.
+    """
+    src = os.path.join(source_dir, "workload.py")
+    if not os.path.isfile(src):
+        return
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+
+    has_param_source = "ParamSource" in text or "register_param_source" in text
+    if not has_param_source:
+        issues.append(
+            "workload.py registered only OpenSearch runners and was not carried over; "
+            "any operation it provided is listed under Skipped Operations")
+        return
+
+    header = (
+        "# Carried over from the OpenSearch workload by convert-workload.\n"
+        "#\n"
+        "# REVIEW BEFORE USE. Param sources build a query in Python, so they cannot be translated\n"
+        "# automatically: the query below is still in OpenSearch syntax and has to be rewritten as\n"
+        "# Solr JSON or a Lucene query string. Any register_runner for an OpenSearch-only operation\n"
+        "# has to go - importing osbenchmark makes the workload fail to load.\n\n"
+    )
+    with open(os.path.join(output_dir, "workload.py"), "w", encoding="utf-8") as f:
+        f.write(header + text)
+    issues.append(
+        "workload.py carried over with a REVIEW header: its param sources still build "
+        "OpenSearch-syntax queries and must be rewritten")
+
+
 # Sentinel filename written to the output directory after successful conversion
 CONVERTED_MARKER = "CONVERTED.md"
 
 # Operation type mapping (same as migrate_workload.py _OP_MAP)
+# The collection the workload targets, set once per conversion. Solr operations name their
+# collection explicitly where OpenSearch infers the index from the request, so an operation that
+# carries none - refresh, commit, optimize - fails at run time with "Operation parameter 'collection'
+# is missing" unless the converter fills it in.
+_TARGET_COLLECTION = None
+
+
 _OP_MAP = {
     "bulk": "bulk-index",
     "index": "bulk-index",
@@ -185,17 +243,40 @@ _OP_MAP = {
     "delete-index": "delete-collection",
     "raw-request": "raw-request",
     "sleep": "sleep",
+    # A refresh makes recent writes searchable; in Solr that is a commit.
+    "refresh": "commit",
+}
+
+# Operations that act on one collection and must be told which.
+_COLLECTION_SCOPED_OPS = {
+    "commit", "optimize", "wait-for-merges", "create-collection", "delete-collection",
+    "bulk-index", "search", "paginated-search", "scroll-search",
 }
 
 # Operations that have no meaningful Solr equivalent (skipped with a note)
+# Backup and restore are implemented for Solr, so they are converted rather than skipped:
+# create-snapshot, wait-for-snapshot-create, restore-snapshot, delete-snapshot and the two
+# repository operations all have runners.
+# Operations with a direct Solr equivalent that is not a rename: the whole definition is replaced.
+_REPLACED_OPS = {
+    "cluster-health": {
+        "operation-type": "raw-request",
+        "method": "GET",
+        "path": "/solr/admin/collections?action=CLUSTERSTATUS&wt=json",
+    },
+    # Upstream waits for merges by polling index-stats until _all.total.merges.current reaches zero.
+    # Solr has a runner for exactly that wait, so the polling condition becomes its parameters
+    # rather than a request Solr cannot answer.
+    "index-stats": {
+        "operation-type": "wait-for-merges",
+        "retry-wait-period": 2.0,
+        "max-wait-seconds": 600,
+        "include-in-reporting": False,
+    },
+}
+
 _UNSUPPORTED_OPS = {
-    "cluster-health",
     "wait-for-recovery",
-    "wait-for-snapshot-create",
-    "restore-snapshot",
-    "create-snapshot",
-    "delete-snapshot-repository",
-    "create-snapshot-repository",
     "put-settings",
     "create-transform",
     "start-transform",
@@ -289,6 +370,10 @@ def convert_opensearch_workload(source_dir: str, output_dir: str) -> dict:
     rendered_workload = _load_workload_json(workload_path)
 
     # --- Generate configsets from index mappings ---
+    global _TARGET_COLLECTION
+    indices = rendered_workload.get("indices") or []
+    _TARGET_COLLECTION = indices[0].get("name") if indices and isinstance(indices[0], dict) else None
+
     _generate_configsets_from_indices(rendered_workload, source_dir, output_dir, issues)
 
     # --- Write converted workload.json (template-preserving) ---
@@ -310,6 +395,7 @@ def convert_opensearch_workload(source_dir: str, output_dir: str) -> dict:
         if index.get("body")
     }
     _copy_auxiliary_files(source_dir, output_dir, skip_files=index_body_files)
+    _convert_workload_py(source_dir, output_dir, issues)
 
     # --- Follow external benchmark.collect() refs and make the workload self-contained ---
     _process_external_collected_files(source_dir, output_dir, issues, skipped)
@@ -458,12 +544,28 @@ def _process_collected_files(source_dir: str, output_dir: str, issues: list, ski
                 shutil.copy2(src_path, dst_path)
                 continue
 
-            # Convert each operation in the fragment; filter out skipped ones
+            # Convert each operation in the fragment; filter out skipped ones.
             if subdir == "operations":
                 ops_list = [
                     op for op in ops_list
                     if not isinstance(op, dict) or _convert_operation(op, issues, skipped, source_dir, output_dir)
                 ]
+            else:
+                # A test procedure can define an operation inline, under its "operation" key rather
+                # than by name. Those were left in OpenSearch form: pmc's default procedure opens
+                # with an inline put-settings, which has no Solr equivalent, and the workload then
+                # failed to load at all. Convert them the same way, and drop the ones that cannot be
+                # converted rather than leaving a task referring to nothing.
+                for procedure in ops_list:
+                    if not isinstance(procedure, dict):
+                        continue
+                    schedule = procedure.get("schedule")
+                    if isinstance(schedule, list):
+                        procedure["schedule"] = [
+                            task for task in schedule
+                            if not isinstance(task, dict)
+                            or _convert_inline_task(task, issues, skipped, source_dir, output_dir)
+                        ]
 
             converted_text = _serialise_jinja_fragment(ops_list, tokens, wrap_array=True)
 
@@ -552,6 +654,42 @@ def _has_auto_date_histogram(aggs: dict) -> bool:
     return False
 
 
+# A collection-scoped operation referenced only by name has nowhere to carry its collection: an
+# OpenSearch refresh takes the index from the request path, and there is no parameter source to fill
+# it in. Such a reference is expanded into an inline operation that names the collection.
+_NAMED_OPS_NEEDING_COLLECTION = {
+    # Keyed by what may appear in a fragment: the upstream name, and the Solr name it maps to, since
+    # a shared fragment may already carry the renamed form.
+    "refresh": "commit",
+    "commit": "commit",
+    "force-merge": "optimize",
+    "optimize": "optimize",
+}
+
+
+def _convert_inline_task(task, issues, skipped, source_dir, output_dir):
+    """
+    Convert a schedule task that defines its operation inline, or names one that needs expanding.
+
+    Returns True if the task should be kept. A task whose inline operation has no Solr equivalent is
+    dropped, since keeping it would leave the procedure referring to an operation that cannot run.
+    """
+    named = task.get("operation")
+    if isinstance(named, str) and named in _NAMED_OPS_NEEDING_COLLECTION and _TARGET_COLLECTION:
+        task["operation"] = {
+            "operation-type": _NAMED_OPS_NEEDING_COLLECTION[named],
+            "collection": _TARGET_COLLECTION,
+        }
+        return True
+
+    inline = task.get("operation")
+    if not isinstance(inline, dict):
+        return True
+    if not (inline.get("operation-type") or inline.get("type")):
+        return True
+    return _convert_operation(inline, issues, skipped, source_dir, output_dir)
+
+
 def _convert_operation(op, issues, skipped, source_dir, output_dir):
     """Convert an operation definition dict in-place.
 
@@ -559,6 +697,16 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
     """
     op_type = op.get("operation-type") or op.get("type", "")
     op_name = op.get("name", op_type)
+
+    if op_type in _REPLACED_OPS:
+        # Checking cluster health is not OpenSearch-specific, only its API is: dropping the operation
+        # left a dangling benchmark.collect reference to an empty fragment, and keeping it left a type
+        # with no runner. Replace the definition and keep the task.
+        replacement = dict(_REPLACED_OPS[op_type])
+        for key in [k for k in op if k not in ("name",)]:
+            del op[key]
+        op.update(replacement)
+        return True
 
     if op_type in _UNSUPPORTED_OPS:
         logger.warning("Skipping unsupported operation '%s' (type: %s)", op_name, op_type)
@@ -598,6 +746,13 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
         op["collection"] = op.pop("index")
     if "indices" in op:
         op["collection"] = op.pop("indices")
+
+    # Fill in the collection for operations that need one and were not given it. An OpenSearch
+    # refresh takes the index from the request path, so the converted operation had nothing to act
+    # on: "Cannot run task [refresh-after-index]: Operation parameter 'collection' is missing".
+    if op.get("operation-type") in _COLLECTION_SCOPED_OPS and not op.get("collection"):
+        if _TARGET_COLLECTION:
+            op["collection"] = _TARGET_COLLECTION
 
     # For create-index → create-collection: inject absolute configset-path when available
     if op_type == "create-index" and output_dir:
@@ -663,7 +818,10 @@ def _copy_auxiliary_files(source_dir: str, output_dir: str, skip_files: set = No
         output_dir: Destination workload directory.
         skip_files: Additional filenames to skip (e.g. index body files like ``index.json``).
     """
-    _skip_files = {"workload.json"} | (skip_files or set())
+    # workload.py is not copied blindly: an upstream one registers OpenSearch runners and imports
+    # osbenchmark, so the converted workload fails to load with "Could not register workload plugin".
+    # It is rewritten below when it holds param sources worth keeping, and dropped otherwise.
+    _skip_files = {"workload.json", "workload.py"} | (skip_files or set())
     # These subdirectories are handled by _process_collected_files and _generate_configsets
     skip_dirs = {"__pycache__", ".git", "configsets", "operations", "test_procedures"}
 
@@ -756,25 +914,57 @@ def _process_external_collected_files(source_dir: str, output_dir: str, issues: 
         """
         try:
             ops_list, tokens = _parse_jinja_fragment(raw, wrap_array=True)
+            kept = []
             for item in ops_list:
                 if not isinstance(item, dict):
+                    kept.append(item)
                     continue
                 op = item.get("operation")
                 if isinstance(op, str):
                     new_op = _OP_MAP.get(op)
                     if new_op and new_op != op:
                         item["operation"] = new_op
+                    # A renamed name may still need a collection; _convert_inline_task expands it.
+                    if not _convert_inline_task(item, issues, skipped, "", ""):
+                        continue
                 elif isinstance(op, dict):
-                    _convert_operation(op, issues, skipped, "", "")
-            return _serialise_jinja_fragment(ops_list, tokens, wrap_array=True)
+                    # The return value decides whether the operation survives, and dropping it was
+                    # the point: a shared fragment carrying cluster-health left the converted
+                    # workload with an operation type Solr has no runner for, so every run failed at
+                    # "No runner available for operation type [cluster-health]".
+                    if not _convert_operation(op, issues, skipped, "", ""):
+                        continue
+                kept.append(item)
+            return _serialise_jinja_fragment(kept, tokens, wrap_array=True)
         except ValueError:
-            # Complex Jinja2 — fall back to text substitution for known op-type strings
+            # Complex Jinja2 — a fragment can put {%- if %} inside a value, which no placeholder
+            # substitution can make parseable. Fall back to text substitution for known op names.
             result = raw
             for old_op, new_op in _OP_MAP.items():
                 if old_op != new_op:
                     result = re.sub(
                         rf'(:\s*"){re.escape(old_op)}(")',
                         rf'\1{new_op}\2',
+                        result,
+                    )
+            # An operation whose whole definition is replaced has to be handled here too: the
+            # structured path does it via _REPLACED_OPS, and a fragment that falls back to text
+            # would otherwise keep a type Solr has no runner for.
+            for old_type, replacement in _REPLACED_OPS.items():
+                pattern = (r'\{[^{}]*"operation-type":\s*"' + re.escape(old_type)
+                           + r'"(?:[^{}]|\{[^{}]*\})*\}')
+                as_json = json.dumps(replacement, indent=8).replace("\n", "\n    ")
+                result = re.sub(pattern, lambda _m, r=as_json: r, result)
+
+            # A collection-scoped operation referenced by name still has nowhere to carry its
+            # collection, and the structured path is what usually expands it. Do the same here, or
+            # the operation fails at run time with "Operation parameter 'collection' is missing".
+            if _TARGET_COLLECTION:
+                for name, op_type in _NAMED_OPS_NEEDING_COLLECTION.items():
+                    result = re.sub(
+                        rf'"operation":\s*"{re.escape(name)}"',
+                        '"operation": {\n            "operation-type": "%s",\n'
+                        '            "collection": "%s"\n        }' % (op_type, _TARGET_COLLECTION),
                         result,
                     )
             return result
