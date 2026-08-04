@@ -33,6 +33,8 @@ from pathlib import Path
 
 import requests
 
+from solrorbit.utils import net
+
 from solrorbit.context import RequestContextHolder
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,20 @@ class CollectionAlreadyExistsError(SolrClientError):
 class CollectionNotFoundError(SolrClientError):
     """Raised when delete_collection() targets a non-existent collection."""
 
+def _tls_verify(ca_certs=None, verify_certs=True):
+    """
+    Resolve the value for ``requests``' ``verify`` from the cluster's client options.
+
+    ``ca_certs`` names a CA bundle to trust, mirroring the option the OpenSearch and
+    Elasticsearch clients accept. It falls back to the bundle resolved by
+    :func:`solrorbit.utils.net.ca_bundle_path`, which is needed because the sessions below
+    set ``trust_env = False`` and therefore do not pick up ``REQUESTS_CA_BUNDLE`` themselves.
+    """
+    if not verify_certs:
+        return False
+    return ca_certs or net.ca_bundle_path()
+
+
 
 # ---------------------------------------------------------------------------
 # SolrAdminClient
@@ -71,13 +87,15 @@ class SolrAdminClient:
 
     def __init__(self, host: str, port: int = 8983,
                  username: str = None, password: str = None,
-                 tls: bool = False, timeout: int = 30):
+                 tls: bool = False, timeout: int = 30,
+                 ca_certs: str = None, verify_certs: bool = True):
         scheme = "https" if tls else "http"
         self.base_url = f"{scheme}://{host}:{port}"
         self.api_url = f"{self.base_url}/api"
         self.timeout = timeout
         self._username = username
         self._password = password
+        self._verify = _tls_verify(ca_certs, verify_certs)
         self._session = None  # created lazily on first use
 
     def _get_session(self) -> requests.Session:
@@ -86,7 +104,10 @@ class SolrAdminClient:
             self._session = requests.Session()
             # Disable automatic proxy detection (trust_env=False) to avoid hanging
             # on macOS after fork() — CFNetwork proxy detection is not fork-safe.
+            # That also disables REQUESTS_CA_BUNDLE, so the bundle is resolved
+            # explicitly and set on the session.
             self._session.trust_env = False
+            self._session.verify = self._verify
             if self._username and self._password:
                 self._session.auth = (self._username, self._password)
             self._session.headers.update({"Accept": "application/json"})
@@ -447,15 +468,17 @@ class SolrClient(RequestContextHolder):  # pylint: disable=too-many-public-metho
             pass
 
     def __init__(self, host="localhost", port=8983, username=None, password=None,
-                 tls=False, timeout=30):
+                 tls=False, timeout=30, ca_certs=None, verify_certs=True):
         self._host = host
         self._port = port
         self._username = username
         self._password = password
         self._tls = tls
         self._timeout = timeout
+        self._verify = _tls_verify(ca_certs, verify_certs)
         self._admin = SolrAdminClient(host=host, port=port, username=username,
-                                      password=password, tls=tls, timeout=timeout)
+                                      password=password, tls=tls, timeout=timeout,
+                                      ca_certs=ca_certs, verify_certs=verify_certs)
         self._pysolr_clients = {}  # collection → pysolr.Solr (created lazily)
         self.transport = SolrClient._NoOpTransport()
 
@@ -539,6 +562,7 @@ class SolrClient(RequestContextHolder):  # pylint: disable=too-many-public-metho
             url = f"{scheme}://{self._host}:{self._port}/solr/{collection}"
             session = requests.Session()
             session.trust_env = False  # fork-safe on macOS (no CFNetwork proxy detection)
+            session.verify = self._verify
             if self._username and self._password:
                 session.auth = (self._username, self._password)
             self._pysolr_clients[collection] = pysolr.Solr(
@@ -585,6 +609,8 @@ class ClientFactory:
             username=self._client_options.get("basic_auth_user"),
             password=self._client_options.get("basic_auth_password"),
             tls=self._client_options.get("use_ssl", False),
+            ca_certs=self._client_options.get("ca_certs"),
+            verify_certs=self._client_options.get("verify_certs", True),
         )
 
     def create_async(self):
