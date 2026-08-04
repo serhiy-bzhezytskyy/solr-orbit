@@ -238,6 +238,40 @@ class TestConvertOpensearchWorkload(unittest.TestCase):
             self.assertNotIn("target-index", out)
             self.assertEqual(2, out.count('"target-collection"'))
 
+    def test_a_templated_collection_body_becomes_a_configset_path(self):
+        # http_logs declares all eight collections as "body": "{{ index_body }}". The literal-value
+        # rewrite cannot see that — it matches the rendered file name — so every collection came out
+        # with no configset and the run died on the first create-collection with "Can not find the
+        # specified config set".
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            path = os.path.join(src, "workload.json")
+            with open(path, "w") as f:
+                f.write('{\n  "indices": [\n'
+                        '    {"name": "logs-1", "body": "{{ index_body }}"},\n'
+                        '    {"name": "logs-2", "body": "{{ index_body }}"}\n'
+                        '  ],\n  "challenges": []\n}')
+            convert_opensearch_workload(src, dst)
+            with open(os.path.join(dst, "workload.json")) as f:
+                out = f.read()
+            self.assertNotIn('"body"', out)
+            self.assertIn('"configset-path": "configsets/logs-1"', out)
+            self.assertIn('"configset-path": "configsets/logs-2"', out)
+
+    def test_a_string_body_outside_the_collections_list_is_left_alone(self):
+        # Only the collections list is rewritten by position; anything else keeping a string-valued
+        # "body" is not a configset reference.
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            path = os.path.join(src, "workload.json")
+            with open(path, "w") as f:
+                f.write('{\n  "indices": [{"name": "logs-1", "body": "{{ index_body }}"}],\n'
+                        '  "corpora": [{"name": "elsewhere", "body": "keep-me"}],\n'
+                        '  "challenges": []\n}')
+            convert_opensearch_workload(src, dst)
+            with open(os.path.join(dst, "workload.json")) as f:
+                out = f.read()
+            self.assertIn('"body": "keep-me"', out)
+            self.assertIn('"configset-path": "configsets/logs-1"', out)
+
     def test_writes_converted_marker(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
             self._make_source_workload(src, {"indices": [], "challenges": []})

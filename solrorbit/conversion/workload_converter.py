@@ -559,16 +559,31 @@ def _write_converted_workload_json(
     # 2. Replace "body": "<index_file>" → "configset-path": "configsets/<name>" for each index.
     #    Index specs use "body" as a string file path; operation "body" fields are dicts/objects,
     #    so a string-value match is safe here.
-    for index in rendered_workload.get("indices", []):
-        name = index.get("name")
-        body_file = index.get("body")
-        if name and body_file:
-            configset_path = f"configsets/{name}"
-            converted_text = re.sub(
-                rf'"body"\s*:\s*"{re.escape(body_file)}"',
-                f'"configset-path": "{configset_path}"',
-                converted_text,
-            )
+    #
+    #    Two passes are needed. The value matched here comes from the *rendered* workload, so it is
+    #    the literal file name; but a workload may write the path through a template variable —
+    #    http_logs declares all eight of its collections as "body": "{{ index_body }}" — and then the
+    #    text carries the unrendered form, no literal matches, and every collection is left without a
+    #    configset. The run fails at the first create-collection with "Can not find the specified
+    #    config set". So the second pass rewrites by *position*: a "body" whose value is a string
+    #    inside a collection block, whatever that string is.
+    #    The literal pass only fires when the body values are distinct. Several collections sharing
+    #    one file — which is what a templated body renders to — would all be rewritten to the first
+    #    collection's configset, so that case is left to the positional pass below.
+    bodies = [index.get("body") for index in rendered_workload.get("indices", []) if index.get("body")]
+    if len(bodies) == len(set(bodies)):
+        for index in rendered_workload.get("indices", []):
+            name = index.get("name")
+            body_file = index.get("body")
+            if name and body_file:
+                configset_path = f"configsets/{name}"
+                converted_text = re.sub(
+                    rf'"body"\s*:\s*"{re.escape(body_file)}"',
+                    f'"configset-path": "{configset_path}"',
+                    converted_text,
+                )
+
+    converted_text = _rewrite_collection_bodies_by_position(converted_text, rendered_workload)
 
     # 3. If the workload inlines operations in "challenges" (not via benchmark.collect()),
     #    perform in-text operation-type renames and inline body translations.
@@ -581,6 +596,53 @@ def _write_converted_workload_json(
     out_path = os.path.join(output_dir, "workload.json")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(converted_text)
+
+
+def _rewrite_collection_bodies_by_position(text: str, rendered_workload: dict) -> str:
+    """
+    Turn a collection's ``"body"`` into ``"configset-path"`` when its value is a template variable.
+
+    The literal-value pass above cannot see such a body: it matches the rendered file name, and the
+    text holds the unrendered ``{{ index_body }}``. Here the key is rewritten wherever it sits next
+    to a ``"name"`` inside the collections list — the position is what identifies it, not the value.
+
+    The path is derived from the collection's own name, matching where the schema generator writes
+    each configset.
+    """
+    names = [index.get("name") for index in rendered_workload.get("indices", []) if index.get("name")]
+    if not names:
+        return text
+
+    # Only touch the collections list; an operation's "body" is an object, not a string, but a
+    # corpus or a challenge could still hold a string-valued "body" and must be left alone.
+    match = re.search(r'"(?:collections|indices)"\s*:\s*\[', text)
+    if not match:
+        return text
+    start = match.end()
+    depth = 1
+    end = start
+    while end < len(text) and depth:
+        if text[end] == "[":
+            depth += 1
+        elif text[end] == "]":
+            depth -= 1
+        end += 1
+    section = text[start:end]
+
+    def replace(m):
+        name = m.group("name")
+        if name not in names:
+            return m.group(0)
+        return m.group(0).replace(m.group("body"), '"configset-path": "configsets/%s"' % name)
+
+    # A block that names a collection and gives it a string body, in either key order.
+    section = re.sub(
+        r'"name"\s*:\s*"(?P<name>[^"]+)"\s*,\s*(?P<body>"body"\s*:\s*"[^"]*")',
+        replace, section)
+    section = re.sub(
+        r'(?P<body>"body"\s*:\s*"[^"]*")\s*,\s*"name"\s*:\s*"(?P<name>[^"]+)"',
+        replace, section)
+    return text[:start] + section + text[end:]
 
 
 def _apply_inline_conversions(text: str, rendered_workload: dict, issues: list, skipped: list) -> str:

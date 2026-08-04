@@ -1402,6 +1402,10 @@ class SolrBulkIndex(SolrRunner):
         # A corpus whose document sets name their own target-collection supplies it per document, so
         # the operation need not carry one; the error is raised only if neither source has it.
         collection = params.get("collection") or params.get("index")
+        # An operation may route its documents through a named update chain — what an OpenSearch
+        # workload calls an ingest pipeline. The two spellings are both accepted so a converted
+        # workload loads unchanged.
+        chain = params.get("update-chain") or params.get("pipeline")
         sc = client
 
         doc_stream = _translate_ndjson_stream(corpus_lines)
@@ -1418,9 +1422,24 @@ class SolrBulkIndex(SolrRunner):
         async def flush(target, batch, final=False):
             nonlocal total_docs, errors
             try:
-                await _run_in_executor(sc.add, target, batch, commit=False, commitWithin=1000)
+                if chain:
+                    # Not through pysolr: it builds the path as handler + "/" + "?commit=…", so a
+                    # handler carrying a query string comes out as "update?update.chain=x/?commit=true"
+                    # and Solr reports 'unknown UpdateRequestProcessorChain: x/'.
+                    path = "/solr/%s/update?%s" % (
+                        urllib.parse.quote(target),
+                        urllib.parse.urlencode({"update.chain": chain, "commitWithin": 1000}))
+                    resp = await _run_in_executor(
+                        sc.raw_request, "POST", path, json.dumps(batch),
+                        {"Content-type": "application/json"})
+                    if resp.status_code >= 400:
+                        raise exceptions.BenchmarkError(
+                            "Update through chain '%s' returned %d: %s"
+                            % (chain, resp.status_code, resp.text[:200]))
+                else:
+                    await _run_in_executor(sc.add, target, batch, commit=False, commitWithin=1000)
                 total_docs += len(batch)
-            except pysolr.SolrError as exc:
+            except (pysolr.SolrError, exceptions.BenchmarkError) as exc:
                 logging.getLogger(__name__).error(
                     "Bulk index error on %sbatch for '%s': %s", "final " if final else "", target, exc)
                 errors += len(batch)
@@ -1517,6 +1536,7 @@ class SolrBinaryBulkIndex(SolrRunner):
         batch_size = params.get("bulk-size", 500)
         do_commit = params.get("commit", False)
         collection = params.get("collection") or params.get("index")
+        chain = params.get("update-chain") or params.get("pipeline")
         sc = client
 
         total_docs = 0
@@ -1538,6 +1558,8 @@ class SolrBinaryBulkIndex(SolrRunner):
                 raise exceptions.BenchmarkError(
                     "Encoding %d documents as %s produced an empty body" % (len(docs), fmt))
             path = "/solr/%s/update" % urllib.parse.quote(target)
+            if chain:
+                path += "?" + urllib.parse.urlencode({"update.chain": chain})
             try:
                 resp = await _run_in_executor(
                     sc.raw_request, "POST", path, payload, {"Content-type": content_type})

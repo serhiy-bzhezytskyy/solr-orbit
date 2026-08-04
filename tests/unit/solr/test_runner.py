@@ -25,6 +25,7 @@ from solrorbit.worker_coordinator.runner import (
     _translate_ndjson_batch,
     SolrBulkIndex,
     SolrSearch,
+    SolrBinaryBulkIndex,
     SolrCreateAlias,
     SolrCreateCollection,
     SolrDeleteAlias,
@@ -305,6 +306,78 @@ class TestSolrBulkIndexTargets(unittest.TestCase):
         # Each collection gets exactly its own two documents, in one flush each.
         self.assertEqual([("logs-181998", ["0", "2"]), ("logs-191998", ["1", "3"])],
                          sorted(client.batches))
+
+
+class _RecordingChainClient:
+    """Records the raw requests a chained update makes, and any pysolr-style adds."""
+
+    def __init__(self, status_code=200):
+        self.requests = []     # (method, path, headers)
+        self.adds = []
+        self.committed = []
+        self.status_code = status_code
+
+    def raw_request(self, method, path, body=None, headers=None):
+        self.requests.append((method, path, headers or {}))
+        resp = MagicMock()
+        resp.status_code = self.status_code
+        resp.text = "" if self.status_code < 400 else "boom"
+        return resp
+
+    def add(self, collection, docs, **kwargs):
+        self.adds.append((collection, [d.get("id") for d in docs]))
+
+    def commit(self, collection, **kwargs):
+        self.committed.append(collection)
+
+
+class TestBulkIndexUpdateChain(unittest.TestCase):
+    """
+    An operation may route documents through a named update chain — what an OpenSearch workload calls
+    an ingest pipeline, and how http_logs' four pipeline operations are ported.
+
+    The request cannot go through pysolr: it builds the path as handler + "/" + "?commit=…", so a
+    handler carrying a query string arrives as "update?update.chain=x/?commit=true" and Solr answers
+    'unknown UpdateRequestProcessorChain: x/'.
+    """
+
+    def _params(self, **extra):
+        lines = ['{"index": {"_id": "a"}}', '{"status": 200}']
+        return {"collection": "logs", "corpus": lines, "bulk-size": 10, **extra}
+
+    def test_no_chain_goes_through_the_normal_add(self):
+        client = _RecordingChainClient()
+        _run(SolrBulkIndex()(client, self._params()))
+        self.assertEqual([("logs", ["a"])], client.adds)
+        self.assertEqual([], client.requests)
+
+    def test_a_chain_is_sent_as_update_chain_on_the_path(self):
+        client = _RecordingChainClient()
+        _run(SolrBulkIndex()(client, self._params(pipeline="grok-pipeline")))
+        self.assertEqual([], client.adds, msg="a chained update must not go through pysolr")
+        self.assertEqual(1, len(client.requests))
+        method, path, headers = client.requests[0]
+        self.assertEqual("POST", method)
+        self.assertIn("/solr/logs/update?", path)
+        self.assertIn("update.chain=grok-pipeline", path)
+        self.assertEqual("application/json", headers.get("Content-type"))
+
+    def test_update_chain_is_accepted_as_a_spelling(self):
+        client = _RecordingChainClient()
+        _run(SolrBulkIndex()(client, self._params(**{"update-chain": "baseline-pipeline"})))
+        self.assertIn("update.chain=baseline-pipeline", client.requests[0][1])
+
+    def test_a_chained_batch_that_fails_is_counted_as_an_error(self):
+        client = _RecordingChainClient(status_code=400)
+        result = _run(SolrBulkIndex()(client, self._params(pipeline="grok-pipeline")))
+        self.assertFalse(result["success"])
+        self.assertEqual(1, result["error-count"])
+
+    def test_the_binary_runner_also_carries_the_chain(self):
+        client = _RecordingChainClient()
+        _run(SolrBinaryBulkIndex()(client, self._params(pipeline="grok-pipeline")))
+        self.assertIn("update.chain=grok-pipeline", client.requests[0][1])
+        self.assertEqual("application/javabin", client.requests[0][2].get("Content-type"))
 
 
 class TestSolrSearch(unittest.TestCase):
