@@ -421,6 +421,18 @@ def create_configset_from_schema(schema_xml: str,
 
   <requestHandler name="/update" class="solr.UpdateRequestHandler" />
 
+  <!-- OpenSearch silently drops a value it cannot coerce: an empty string for an integer field
+       leaves the document indexed with that field simply absent. Solr rejects it instead, with
+       "Error adding field 'x'='' msg=For input string: \"\"", so a corpus that OpenSearch accepts
+       cannot be indexed at all. In pmc that is 59.6% of documents, on a field two operations sort by.
+       This chain reproduces the OpenSearch behaviour: blanks are removed before the typed fields are
+       parsed, so the field is absent rather than the document rejected. -->
+  <updateRequestProcessorChain name="drop-blanks" default="true">
+    <processor class="solr.RemoveBlankFieldUpdateProcessorFactory" />
+    <processor class="solr.LogUpdateProcessorFactory" />
+    <processor class="solr.RunUpdateProcessorFactory" />
+  </updateRequestProcessorChain>
+
   <requestHandler name="/admin/ping" class="solr.PingRequestHandler">
     <lst name="invariants">
       <str name="q">solrpingquery</str>
