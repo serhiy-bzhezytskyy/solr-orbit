@@ -24,6 +24,9 @@ import unittest
 
 from solrorbit.conversion.workload_converter import (
     CONVERTED_MARKER,
+    _jinja_restore,
+    _jinja_substitute,
+    _parse_jinja_fragment,
     convert_opensearch_workload,
     detect_workload_format_from_file,
     is_already_converted,
@@ -198,6 +201,43 @@ class TestConvertOpensearchWorkload(unittest.TestCase):
             result = convert_opensearch_workload(src, dst)
             self.assertNotIn("snap", result["skipped"])
 
+    def test_nested_fragment_directory_is_converted(self):
+        # A fragment can be collected by a nested path, as http_logs does with
+        # test_procedures/intra_segment/. Listing only the top level dropped it from the output, the
+        # collect call then rendered to nothing, and the workload failed to load on a dangling comma.
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            self._make_source_workload(src, {"indices": [], "challenges": []})
+            nested = os.path.join(src, "test_procedures", "intra_segment")
+            os.makedirs(nested)
+            with open(os.path.join(nested, "schedule.json"), "w") as f:
+                f.write('{"name": "nested", "operation": "match-all"}')
+            convert_opensearch_workload(src, dst)
+            self.assertTrue(
+                os.path.isfile(os.path.join(dst, "test_procedures", "intra_segment", "schedule.json")),
+                msg="nested fragment was not carried over",
+            )
+
+    def test_target_index_in_corpora_is_renamed(self):
+        # The loader defaults target-collection only for a single-collection workload. http_logs has
+        # 21, so each document spec names its own and the key has to be renamed or validation fails.
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            self._make_source_workload(src, {
+                "indices": [{"name": "logs-1"}, {"name": "logs-2"}],
+                "corpora": [{
+                    "name": "http_logs",
+                    "documents": [
+                        {"target-index": "logs-1", "source-file": "a.json.bz2", "document-count": 1},
+                        {"target-index": "logs-2", "source-file": "b.json.bz2", "document-count": 2},
+                    ],
+                }],
+                "challenges": [],
+            })
+            convert_opensearch_workload(src, dst)
+            with open(os.path.join(dst, "workload.json")) as f:
+                out = f.read()
+            self.assertNotIn("target-index", out)
+            self.assertEqual(2, out.count('"target-collection"'))
+
     def test_writes_converted_marker(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
             self._make_source_workload(src, {"indices": [], "challenges": []})
@@ -362,6 +402,105 @@ class TestCalendarIntervalToSolrGap(unittest.TestCase):
 
     def test_case_insensitive(self):
         self.assertEqual("+1MONTH", _calendar_interval_to_solr_gap("MONTH"))
+
+
+class TestJinjaSubstituteRoundTrip(unittest.TestCase):
+    """
+    A workload file is a Jinja template, so the converter replaces each template token with a
+    JSON-safe placeholder, parses, converts, and puts the tokens back. These are the two shapes
+    that made the placeholder itself unparseable, both taken from http_logs — the first workload
+    to use them, and the reason its operations file was copied verbatim instead of converted.
+    """
+
+    def _round_trip(self, source):
+        modified, tokens = _jinja_substitute(source)
+        # The point of the substitution is that what comes out is parseable JSON.
+        parsed = json.loads(modified)
+        return modified, _jinja_restore(json.dumps(parsed), tokens)
+
+    def test_expression_inside_a_string_literal_keeps_the_literal_intact(self):
+        # "now-{{p}}d/d" — the expression is part of a larger string. Substituting the expression
+        # alone puts the placeholder's own quotes mid-literal: "now-"__J_0__"d/d".
+        source = '{"gte": "now-{{ p | default(30) }}d/d", "lt": "now/d"}'
+        modified, restored = self._round_trip(source)
+        self.assertNotIn('"now-"', modified)
+        self.assertEqual(json.loads(source.replace("{{ p | default(30) }}", "30")),
+                         json.loads(restored.replace("{{ p | default(30) }}", "30")))
+
+    def test_for_loop_is_taken_as_one_block(self):
+        # The loop *generates* the array elements, so its opening tag is not a value on its own.
+        source = ('{"processors": [\n'
+                  '  {% for i in range(1, 101) %}\n'
+                  '  {"rename_field": {"field": "status", "target_field": "status_{{ i }}"}}'
+                  '{% if not loop.last %},{% endif %}\n'
+                  '  {% endfor %}\n'
+                  ']}')
+        modified, restored = self._round_trip(source)
+        self.assertEqual(1, len(json.loads(modified)["processors"]))
+        self.assertIn("{% for i in range(1, 101) %}", restored)
+        self.assertIn("{% endfor %}", restored)
+        self.assertIn("status_{{ i }}", restored)
+
+    def test_conditional_generating_a_key_value_pair(self):
+        # A tag can generate a whole pair, not a value, so its placeholder lands where the object
+        # expects "key": value. This is upstream's common_operations/force_merge.json, which every
+        # workload collects — so until this was fixed, every one of them took the text-only fallback.
+        source = ('{"operation": {\n'
+                  '  "operation-type": "force-merge",\n'
+                  '  "request-timeout": {{ request_timeout | default(60) | tojson }}'
+                  '{%- if max_num_segments is defined %},\n'
+                  '  "max-num-segments": {{ max_num_segments | tojson }}\n'
+                  '  {%- endif %}\n'
+                  '}}')
+        _, restored = self._round_trip(source)
+        for tag in ("{%- if max_num_segments is defined %}", "{%- endif %}",
+                    "{{ max_num_segments | tojson }}"):
+            self.assertIn(tag, restored)
+        self.assertNotIn("__J_", restored)
+        self.assertNotIn("null", restored)
+
+    def test_restored_template_renders_the_same_as_the_source(self):
+        # Round-tripping to text that parses is not enough: what runs is the *rendered* template,
+        # and both branches of the conditional have to come out unchanged.
+        jinja2 = __import__("jinja2")
+        source = ('{"operation": {\n'
+                  '  "request-timeout": {{ request_timeout | default(60) | tojson }}'
+                  '{%- if max_num_segments is defined %},\n'
+                  '  "max-num-segments": {{ max_num_segments | tojson }}\n'
+                  '  {%- endif %}\n'
+                  '}}')
+        _, restored = self._round_trip(source)
+        env = jinja2.Environment()
+        for context in ({}, {"max_num_segments": 1}):
+            self.assertEqual(json.loads(env.from_string(source).render(**context)),
+                             json.loads(env.from_string(restored).render(**context)),
+                             msg=f"differs with context {context}")
+
+    def test_plain_quoted_expression_still_round_trips(self):
+        # The pre-existing shape, to show the two additions did not displace it.
+        source = '{"clients": "{{ bulk_indexing_clients | default(8) }}"}'
+        _, restored = self._round_trip(source)
+        self.assertEqual(source, restored)
+
+
+class TestHttpLogsShapedFragmentParses(unittest.TestCase):
+    """
+    Both defects above surfaced as the same symptom — a file the converter could not parse, so it
+    fell back to copying it verbatim, OpenSearch operation types and all. This drives the parse
+    entry point rather than the substitution, because that fallback is what the user sees.
+    """
+
+    def test_fragment_with_both_shapes_parses(self):
+        fragment = ('{"name": "range", "body": {"query": {"range": {"@timestamp":\n'
+                    '  {"gte": "now-{{ p | default(30) }}d/d", "lt": "now/d"}}}}},\n'
+                    '{"name": "renames", "body": {"response_processors": [\n'
+                    '  {% for i in range(1, 101) %}\n'
+                    '  {"rename_field": {"target_field": "status_{{ i }}"}}'
+                    '{% if not loop.last %},{% endif %}\n'
+                    '  {% endfor %}\n'
+                    ']}}')
+        parsed, _ = _parse_jinja_fragment(fragment, wrap_array=True)
+        self.assertEqual(["range", "renames"], [entry["name"] for entry in parsed])
 
 
 if __name__ == "__main__":

@@ -55,7 +55,16 @@ logger = logging.getLogger(__name__)
 #  3. Any remaining Jinja2 block tag or expression
 _JINJA_RE = re.compile(
     r'"(\{\{[^}]*?\}\})"'            # group 1: already-quoted {{expr}}
+    # A string literal that only *contains* an expression, e.g. "now-{{p}}d/d": the whole literal
+    # (quotes included) becomes one token, because substituting the expression alone would put the
+    # placeholder's own quotes in the middle of the literal and break the JSON.
+    r'|"(?:[^"\\\n]|\\.)*?\{\{[^}]*?\}\}(?:[^"\\\n]|\\.)*?"'
     r'|\{%-?\s*if\b.*?\{%-?\s*endif\s*-?%\}'  # full if/else/endif block
+    # A for/endfor block is taken whole for the same reason as if/endif: the loop *generates* the
+    # array elements, so its opening tag alone is not a value and a placeholder in its place leaves
+    # the body of the loop as a bare element with no separator. http_logs writes a 100-iteration
+    # rename_field loop this way, which is how its operations file came out copied verbatim.
+    r'|\{%-?\s*for\b.*?\{%-?\s*endfor\s*-?%\}'
     r'|\{%.*?%\}'                    # any other block tag
     r'|\{\{.*?\}\}',                 # bare {{expr}}
     re.DOTALL,
@@ -95,7 +104,67 @@ def _jinja_substitute(text: str):
     # separator the placeholders need; _jinja_restore drops it again with the placeholder.
     # Mark the inserted separator so restore removes exactly the ones it added, and no real comma.
     modified = re.sub(r'"(__J_\d+__)"(\s*)(?=["{\[])', r'"\1_SEP"\2, ', modified)
+    modified = _mark_placeholders_in_key_position(modified)
     return modified, tokens
+
+
+def _mark_placeholders_in_key_position(text: str) -> str:
+    """
+    Give a placeholder that stands where an object key belongs something to be the key *of*.
+
+    A conditional tag can generate a whole key/value pair, not a value::
+
+        "request-timeout": {{ request_timeout }}{%- if max_num_segments is defined %},
+        "max-num-segments": {{ max_num_segments }}
+        {%- endif %}
+
+    The tag becomes one placeholder, and it lands between the previous pair and the closing brace —
+    a bare string where the object expects ``"key": value``. Appending ``: null`` there is what makes
+    the fragment parse; ``_jinja_restore`` drops the marker and the null with it. Every
+    ``common_operations/force_merge.json`` in the upstream tree is written this way, so until now
+    every workload that force-merges took the text-only fallback for that file.
+
+    Key position is decided by scanning, not by a lookaround: it depends on the enclosing container
+    being an object and on the previous significant character, neither of which a regex can see.
+    """
+    out = []
+    stack = []          # '{' or '[' per open container
+    prev_significant = ""
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            # Read the whole string literal, honouring escapes.
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            literal = text[i:j + 1]
+            in_object = bool(stack) and stack[-1] == "{"
+            expects_key = in_object and prev_significant in ("{", ",")
+            match = re.fullmatch(r'"(__J_\d+__(?:_SEP)?)"', literal)
+            if expects_key and match:
+                out.append('"%s_KV": null' % match.group(1))
+            else:
+                out.append(literal)
+            prev_significant = '"'
+            i = j + 1
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        if not ch.isspace():
+            prev_significant = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _jinja_restore(json_text: str, tokens: list) -> str:
@@ -109,6 +178,20 @@ def _jinja_restore(json_text: str, tokens: list) -> str:
     """
     # The separator marker is dropped wholesale: it never belonged to the workload.
     for idx, (original, was_quoted) in enumerate(tokens):
+        # A tag standing where an object key belongs was given a null value to be the key of; the
+        # marker and that value come off here. Which commas go with them is decided by what the tag
+        # itself emits: a block that generates a pair has to carry its own leading separator, because
+        # it may render to nothing at all — force_merge.json writes `{%- if … %},\n "key": value`.
+        # So the comma the serialiser put *before* the placeholder is dropped, and the one *after* is
+        # kept: the converter can append a key of its own after the block (a `collection`, say), and
+        # that key still needs a separator in the branch where the block renders empty.
+        for suffix in ("___SEP_KV", "___KV"):
+            base = f'"__J_{idx}__"'
+            marked = re.escape(f'"__J_{idx}{suffix}"') + r'\s*:\s*null'
+            json_text = re.sub(r',\s*' + marked + r'(\s*),', base + r'\1,', json_text)
+            json_text = re.sub(r',\s*' + marked, base, json_text)
+            json_text = re.sub(marked + r'(\s*),', base + r'\1,', json_text)
+            json_text = re.sub(marked, base, json_text)
         # A tag that had no comma in the source got one so the fragment would parse as an array; its
         # placeholder carries a _SEP suffix, and both the suffix and the comma go away here.
         json_text = json_text.replace(f'"__J_{idx}___SEP",', f'"__J_{idx}__"')
@@ -455,6 +538,13 @@ def _write_converted_workload_json(
     #    Use word-boundary to avoid false matches like "field_indices"
     converted_text = re.sub(r'(?m)^(\s*)"indices"\s*:', r'\1"collections":', raw_text)
 
+    # 1b. Rename "target-index": → "target-collection": inside corpora document specs. The loader
+    #     only defaults this key when the workload declares exactly one collection; http_logs
+    #     declares 21, one per monthly log file, so each document spec has to name its own and the
+    #     workload fails validation with "Mandatory element 'target-collection' is missing" without
+    #     this. The earlier workloads have a single collection, which is why it never came up.
+    converted_text = re.sub(r'"target-index"\s*:', '"target-collection":', converted_text)
+
     # 2. Replace "body": "<index_file>" → "configset-path": "configsets/<name>" for each index.
     #    Index specs use "body" as a string file path; operation "body" fields are dicts/objects,
     #    so a string-value match is safe here.
@@ -513,13 +603,38 @@ def _apply_inline_conversions(text: str, rendered_workload: dict, issues: list, 
         return text
 
 
+def _walk_json_fragments(src_root: str, dst_root: str):
+    """
+    Yield ``(src_path, dst_path)`` for every ``.json`` file under *src_root*, at any depth.
+
+    Sub-directories are mirrored under *dst_root* and created as they are encountered, so a
+    fragment collected by a nested path lands where the collect call expects it.
+    """
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        rel_dir = os.path.relpath(dirpath, src_root)
+        dst_dir = dst_root if rel_dir == "." else os.path.join(dst_root, rel_dir)
+        made = False
+        for filename in sorted(filenames):
+            if not filename.endswith(".json"):
+                continue
+            if not made:
+                os.makedirs(dst_dir, exist_ok=True)
+                made = True
+            yield os.path.join(dirpath, filename), os.path.join(dst_dir, filename)
+
+
 def _process_collected_files(source_dir: str, output_dir: str, issues: list, skipped: list):
     """
     Process JSON fragment files referenced via benchmark.collect() in workload.json.
 
-    Scans ``operations/`` and ``test_procedures/`` sub-directories, parses each JSON
-    fragment using Jinja2-placeholder substitution, applies operation conversions, and
+    Scans ``operations/`` and ``test_procedures/`` sub-directories **recursively**, parses each
+    JSON fragment using Jinja2-placeholder substitution, applies operation conversions, and
     writes the result to the corresponding location in *output_dir*.
+
+    The walk has to be recursive: a fragment may live in a nested directory and be collected by
+    path, as http_logs' ``test_procedures/intra_segment/intra-segment-schedule.json`` is. Listing
+    only the top level left that file out of the output entirely, so the collect call rendered to
+    nothing and the workload failed to load on a dangling comma.
     """
     for subdir in ("operations", "test_procedures"):
         src_subdir = os.path.join(source_dir, subdir)
@@ -528,11 +643,8 @@ def _process_collected_files(source_dir: str, output_dir: str, issues: list, ski
         dst_subdir = os.path.join(output_dir, subdir)
         os.makedirs(dst_subdir, exist_ok=True)
 
-        for filename in os.listdir(src_subdir):
-            if not filename.endswith(".json"):
-                continue
-            src_path = os.path.join(src_subdir, filename)
-            dst_path = os.path.join(dst_subdir, filename)
+        for src_path, dst_path in _walk_json_fragments(src_subdir, dst_subdir):
+            filename = os.path.relpath(src_path, src_subdir)
 
             with open(src_path, encoding="utf-8") as f:
                 raw = f.read()
@@ -898,7 +1010,7 @@ def _process_external_collected_files(source_dir: str, output_dir: str, issues: 
         with open(ext_abs, encoding="utf-8") as f:
             raw = f.read()
 
-        converted = _convert_fragment_text(raw, issues, skipped)
+        converted = _convert_fragment_text(raw, issues, skipped, rel_from_parent)
         with open(dst_abs, "w", encoding="utf-8") as f:
             f.write(converted)
 
@@ -906,7 +1018,7 @@ def _process_external_collected_files(source_dir: str, output_dir: str, issues: 
         _process_one_file(dst_abs, ext_abs)
         return dst_abs
 
-    def _convert_fragment_text(raw: str, issues: list, skipped: list) -> str:
+    def _convert_fragment_text(raw: str, issues: list, skipped: list, rel_path: str = "?") -> str:
         """
         Convert operation types in a fragment file (JSON or Jinja2-with-JSON).
 
@@ -936,9 +1048,17 @@ def _process_external_collected_files(source_dir: str, output_dir: str, issues: 
                         continue
                 kept.append(item)
             return _serialise_jinja_fragment(kept, tokens, wrap_array=True)
-        except ValueError:
+        except ValueError as exc:
             # Complex Jinja2 — a fragment can put {%- if %} inside a value, which no placeholder
             # substitution can make parseable. Fall back to text substitution for known op names.
+            # Say so: the fallback renames operation types but does not translate query bodies, so a
+            # fragment that lands here is only partly converted. pmc's restore_snapshot.json took
+            # this path for a shape the substitution can in fact handle, and nothing in the report
+            # said so — the file looked converted because it is valid JSON either way.
+            issues.append(
+                f"{rel_path}: fell back to text-only conversion ({exc}); "
+                "operation types renamed, query bodies not translated"
+            )
             result = raw
             for old_op, new_op in _OP_MAP.items():
                 if old_op != new_op:
