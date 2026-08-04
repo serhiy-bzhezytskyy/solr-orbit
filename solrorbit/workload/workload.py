@@ -497,6 +497,7 @@ class OperationType(Enum):
     CreateBackupRepository = (34, AdminStatus.Yes)
     CreateBackup = (35, AdminStatus.Yes)
     RestoreBackup = (36, AdminStatus.Yes)
+    DeleteBackup = (37, AdminStatus.Yes)
 
     def __init__(self, op_id: int, admin_status: AdminStatus):
         self.op_id = op_id
@@ -526,16 +527,21 @@ class OperationType(Enum):
             return OperationType.RawRequest
         elif v == "sleep":
             return OperationType.Sleep
-        elif v == "delete-backup-repository":
+        # Solr calls these backups; a workload converted from OpenSearch calls them snapshots.
+        # Both spellings are accepted so that a converted workload loads unchanged.
+        elif v in ("delete-backup-repository", "delete-snapshot-repository"):
             return OperationType.DeleteBackupRepository
-        elif v == "create-backup-repository":
+        elif v in ("create-backup-repository", "create-snapshot-repository"):
             return OperationType.CreateBackupRepository
-        elif v == "create-backup":
+        elif v in ("create-backup", "create-snapshot"):
             return OperationType.CreateBackup
-        elif v == "wait-for-backup-create":
+        elif v in ("wait-for-backup-create", "wait-for-snapshot-create"):
             return OperationType.WaitForBackupCreate
-        elif v == "restore-backup":
+        elif v in ("restore-backup", "restore-snapshot"):
             return OperationType.RestoreBackup
+        elif v in ("delete-backup", "delete-snapshot"):
+            # Deleting a backup is a collections-API call, unlike removing a repository.
+            return OperationType.DeleteBackup
         elif v == "composite":
             return OperationType.Composite
         else:

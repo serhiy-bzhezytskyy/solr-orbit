@@ -1291,3 +1291,176 @@ class SolrRunnerTimingBoundaryTests(TestCase):
                                            {"collection": "test", "q": "*:*"})
 
         self.assertEqual(0, result["hits"])
+
+class BackupRunnerTests(TestCase):
+    """
+    The backup runners carry OpenSearch's snapshot operation names and drive Solr's backup and
+    restore APIs. A fake client records the calls, since what matters is which endpoint each runner
+    hits and with what.
+    """
+
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise AssertionError("unexpected status %d" % self.status_code)
+
+    class FakeSolrClient:
+        def __init__(self, *payloads):
+            self.calls = []
+            self._payloads = list(payloads)
+
+        def raw_request(self, method, path, body=None, headers=None):
+            self.calls.append((method, path, body))
+            payload = self._payloads.pop(0) if self._payloads else {}
+            status = payload.pop("__status", 200) if isinstance(payload, dict) else 200
+            return BackupRunnerTests.FakeResponse(payload, status)
+
+    @run_async
+    async def test_create_backup_posts_to_the_versions_endpoint_and_waits(self):
+        client = self.FakeSolrClient(
+            {"requestid": "backup-snap"},
+            {"status": {"state": "completed"},
+             "success": {"node": {"response": {"indexFileCount": 181, "indexSizeMB": 368.96}}}})
+        r = runner.CreateBackup()
+
+        result = await r(client, {"collection": "geonames", "snapshot": "snap",
+                                  "location": "/var/solr/data/backups"})
+
+        self.assertEqual("POST", client.calls[0][0])
+        self.assertEqual("/api/collections/geonames/backups/snap/versions", client.calls[0][1])
+        self.assertEqual("/var/solr/data/backups", client.calls[0][2]["location"])
+        self.assertIn("REQUESTSTATUS", client.calls[1][1])
+        self.assertEqual(181, result["index-file-count"])
+        self.assertEqual(368.96, result["index-size-mb"])
+
+    @run_async
+    async def test_create_backup_raises_when_the_async_call_fails(self):
+        client = self.FakeSolrClient(
+            {"requestid": "backup-snap"},
+            {"status": {"state": "failed"}, "failure": {"node": "no space left"}})
+        r = runner.CreateBackup()
+
+        # The collections API answers 200 with a body describing the failure, so a runner that only
+        # checked the status code would report success.
+        with self.assertRaises(exceptions.BenchmarkError):
+            await r(client, {"collection": "geonames", "snapshot": "snap", "location": "/tmp/b"})
+
+    @run_async
+    async def test_a_backup_needs_a_location_or_a_repository(self):
+        r = runner.CreateBackup()
+
+        with self.assertRaises(exceptions.DataError):
+            await r(self.FakeSolrClient(), {"collection": "geonames", "snapshot": "snap"})
+
+    @run_async
+    async def test_a_repository_is_used_instead_of_a_location(self):
+        client = self.FakeSolrClient({"requestid": "x"}, {"status": {"state": "completed"}})
+        r = runner.CreateBackup()
+
+        await r(client, {"collection": "geonames", "snapshot": "snap", "repository": "s3"})
+
+        self.assertEqual("s3", client.calls[0][2]["repository"])
+        self.assertNotIn("location", client.calls[0][2])
+
+    @run_async
+    async def test_wait_for_backup_create_reports_what_the_backup_holds(self):
+        client = self.FakeSolrClient(
+            {"backups": [{"backupId": 0, "indexFileCount": 181, "indexSizeMB": 368.96}]})
+        r = runner.WaitForBackupCreate()
+
+        result = await r(client, {"snapshot": "snap", "location": "/tmp/b",
+                                  "collection": "geonames"})
+
+        self.assertIn("LISTBACKUP", client.calls[0][1])
+        self.assertEqual(0, result["backup-id"])
+        self.assertEqual(181, result["index-file-count"])
+
+    @run_async
+    async def test_restore_backup_targets_the_named_collection(self):
+        client = self.FakeSolrClient({"requestid": "restore-x"},
+                                     {"status": {"state": "completed"}})
+        r = runner.RestoreBackup()
+
+        await r(client, {"collection": "restored", "snapshot": "snap", "location": "/tmp/b"})
+
+        self.assertIn("action=RESTORE", client.calls[0][1])
+        self.assertIn("collection=restored", client.calls[0][1])
+
+    @run_async
+    async def test_delete_backup_deletes_every_backup_point_when_no_id_is_given(self):
+        # purgeUnused alone only drops orphaned index files and leaves the backup in place, which
+        # reports success while deleting nothing. Each backup point has to be named.
+        client = self.FakeSolrClient(
+            {"backups": [{"backupId": 0}, {"backupId": 1}]},
+            {"deleted": [{"backupId": 0}]},
+            {"deleted": [{"backupId": 1}]})
+        r = runner.DeleteBackup()
+
+        result = await r(client, {"snapshot": "snap", "location": "/tmp/b"})
+
+        self.assertIn("LISTBACKUP", client.calls[0][1])
+        self.assertIn("backupId=0", client.calls[1][1])
+        self.assertIn("backupId=1", client.calls[2][1])
+        self.assertEqual(2, result["deleted-backup-ids"])
+
+    @run_async
+    async def test_delete_backup_honours_an_explicit_id(self):
+        client = self.FakeSolrClient({"deleted": [{"backupId": 3}]})
+        r = runner.DeleteBackup()
+
+        await r(client, {"snapshot": "snap", "location": "/tmp/b", "backup-id": 3})
+
+        self.assertEqual(1, len(client.calls))
+        self.assertIn("backupId=3", client.calls[0][1])
+
+    @run_async
+    async def test_delete_backup_accepts_the_object_response_shape(self):
+        # DELETEBACKUP answers with an object for maxNumBackupPoints and a list for backupId.
+        client = self.FakeSolrClient({"deleted": {"numBackupIds": 2, "numIndexFiles": 40}})
+        r = runner.DeleteBackup()
+
+        result = await r(client, {"snapshot": "snap", "location": "/tmp/b",
+                                  "max-num-backup-points": 1})
+
+        self.assertIn("maxNumBackupPoints=1", client.calls[0][1])
+        self.assertEqual(2, result["deleted-backup-ids"])
+        self.assertEqual(40, result["deleted-index-files"])
+
+    @run_async
+    async def test_creating_a_repository_accepts_a_location(self):
+        # Solr has no API for creating a repository; a location needs none.
+        result = await runner.CreateBackupRepository()(self.FakeSolrClient(),
+                                                       {"location": "/tmp/b"})
+
+        self.assertTrue(result["success"])
+
+    @run_async
+    async def test_an_undeclared_repository_is_reported(self):
+        client = self.FakeSolrClient({"repositories": [{"name": "gcs"}]})
+
+        with self.assertRaises(exceptions.DataError):
+            await runner.CreateBackupRepository()(client, {"repository": "s3"})
+
+    @run_async
+    async def test_a_declared_repository_is_accepted(self):
+        client = self.FakeSolrClient({"repositories": [{"name": "s3"}]})
+
+        result = await runner.CreateBackupRepository()(client, {"repository": "s3"})
+
+        self.assertTrue(result["success"])
+
+    @run_async
+    async def test_the_snapshot_operation_names_resolve_to_runners(self):
+        runner.register_default_runners()
+
+        for name in ["create-snapshot", "delete-snapshot", "restore-snapshot",
+                     "wait-for-snapshot-create", "create-snapshot-repository",
+                     "delete-snapshot-repository"]:
+            self.assertIsNotNone(runner.runner_for(name), "%s has no runner" % name)

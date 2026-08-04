@@ -32,6 +32,7 @@ import logging
 import re
 import sys
 import time
+import urllib.parse
 import types
 from io import BytesIO
 from typing import List
@@ -51,12 +52,23 @@ def register_default_runners():
     # Engine-agnostic operations
     register_runner(workload.OperationType.Sleep, Sleep(), async_runner=True)
     register_runner(workload.OperationType.Composite, Composite(), async_runner=True)
-    # Backup operations (TODO: port to Solr backup API)
-    register_runner(workload.OperationType.CreateBackup, CreateBackup(), async_runner=True)
-    register_runner(workload.OperationType.RestoreBackup, RestoreBackup(), async_runner=True)
-    register_runner(workload.OperationType.DeleteBackupRepository, Retry(DeleteBackupRepository()), async_runner=True)
-    register_runner(workload.OperationType.CreateBackupRepository, Retry(CreateBackupRepository()), async_runner=True)
-    register_runner(workload.OperationType.WaitForBackupCreate, Retry(WaitForBackupCreate()), async_runner=True)
+    # Backup and restore. Registered under both spellings: OperationType renders these as
+    # "create-backup" and the like, while a workload converted from OpenSearch declares
+    # "create-snapshot", and runner_for() is called with the workload's own string.
+    _backup_runners = {
+        workload.OperationType.CreateBackup: (CreateBackup(), "create-snapshot"),
+        workload.OperationType.RestoreBackup: (RestoreBackup(), "restore-snapshot"),
+        workload.OperationType.DeleteBackup: (Retry(DeleteBackup()), "delete-snapshot"),
+        workload.OperationType.DeleteBackupRepository:
+            (Retry(DeleteBackupRepository()), "delete-snapshot-repository"),
+        workload.OperationType.CreateBackupRepository:
+            (Retry(CreateBackupRepository()), "create-snapshot-repository"),
+        workload.OperationType.WaitForBackupCreate:
+            (Retry(WaitForBackupCreate()), "wait-for-snapshot-create"),
+    }
+    for operation_type, (backup_runner, snapshot_alias) in _backup_runners.items():
+        register_runner(operation_type, backup_runner, async_runner=True)
+        register_runner(snapshot_alias, backup_runner, async_runner=True)
     # Solr-native runners
     register_runner("bulk-index", SolrBulkIndex(), async_runner=True)
     register_runner("search", SolrSearch(), async_runner=True)
@@ -469,92 +481,288 @@ class Sleep(Runner):
         return "sleep"
 
 
-class DeleteBackupRepository(Runner):
-    # TODO: Port to Solr — implement using Solr backup/restore V2 API:
-    #   POST /api/collections/{collection}/backups/{name}/versions
-    #   Docs: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html
-    #   Current implementation is OpenSearch-specific and will fail against Solr.
-    """
-    Deletes a snapshot repository
-    """
-    async def __call__(self, client, params):
-        raise exceptions.BenchmarkError(
-            f"[{repr(self)}] is not yet implemented for Apache Solr. "
-            "Port to Solr Backup V2 API: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html"
-        )
+# ---------------------------------------------------------------------------
+# Runners: backup and restore
+#
+# These carry the operation names of OpenSearch's snapshot operations, so a converted workload
+# keeps working, and map them onto Solr's backup and restore APIs:
+#
+#   create-snapshot            POST /api/collections/<collection>/backups/<name>/versions
+#   wait-for-snapshot-create   action=LISTBACKUP
+#   restore-snapshot           action=RESTORE
+#   delete-snapshot            action=DELETEBACKUP
+#
+# Solr has no API that creates a named repository: repositories are declared in solr.xml with a
+# <repository> element and selected per call with the "repository" parameter. The two
+# repository operations therefore validate their configuration instead of issuing a request.
+# ---------------------------------------------------------------------------
 
-    def __repr__(self, *args, **kwargs):
-        return "delete-snapshot-repository"
+_BACKUP_POLL_INTERVAL = 1.0
+
+
+def _backup_location(params):
+    """Where the backup lives. Solr requires a path the node is allowed to write to."""
+    location = params.get("location") or params.get("path")
+    if not location:
+        raise exceptions.DataError(
+            "Operation parameter 'location' is missing. Solr takes the backup destination per "
+            "call: give the operation a 'location' the node is allowed to write to, or set "
+            "solr.allowPaths. A named repository declared in solr.xml can be selected with "
+            "'repository' instead.")
+    return location
+
+
+def _backup_query(params, **extra):
+    """Common query parameters for the collections API, dropping the ones left unset."""
+    query = {"name": params.get("snapshot") or params.get("name"), **extra}
+    if params.get("repository"):
+        query["repository"] = params["repository"]
+    else:
+        query["location"] = _backup_location(params)
+    if not query["name"]:
+        raise exceptions.DataError("Operation parameter 'snapshot' is missing.")
+    return {k: v for k, v in query.items() if v is not None}
+
+
+async def _await_collections_api(client, request_id, timeout):
+    """
+    Poll REQUESTSTATUS until an asynchronous collections-API call settles.
+
+    Backup and restore of a real corpus outlast an HTTP request, so they are submitted with async
+    and their outcome is collected here. A failure has to be raised rather than returned: the
+    collections API answers 200 with a body describing the failure.
+    """
+    deadline = time.perf_counter() + timeout
+    while True:
+        response = await _run_in_executor(
+            client.raw_request, "GET",
+            "/solr/admin/collections?action=REQUESTSTATUS&requestid=%s" % request_id, None, None)
+        response.raise_for_status()
+        payload = response.json()
+        state = (payload.get("status") or {}).get("state")
+        if state == "completed":
+            return payload
+        if state == "failed":
+            raise exceptions.BenchmarkError(
+                "Collections API request [%s] failed: %s" % (request_id, payload.get("failure")))
+        if time.perf_counter() > deadline:
+            raise exceptions.BenchmarkError(
+                "Collections API request [%s] did not finish within %s seconds; last state [%s]"
+                % (request_id, timeout, state))
+        await asyncio.sleep(_BACKUP_POLL_INTERVAL)
 
 
 class CreateBackupRepository(Runner):
-    # TODO: Port to Solr — implement using Solr backup/restore V2 API:
-    #   POST /api/collections/{collection}/backups/{name}/versions
-    #   Docs: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html
-    #   Current implementation is OpenSearch-specific and will fail against Solr.
     """
-    Creates a new snapshot repository
+    Check that a backup repository is usable.
+
+    Solr has no API for creating one: a repository is a <repository> element in solr.xml, read at
+    node startup, and selected per call with the "repository" parameter. An operation naming a
+    repository is accepted if the cluster knows it; an operation carrying only a "location" is
+    accepted as-is, since Solr takes a destination path per call.
     """
     async def __call__(self, client, params):
-        raise exceptions.BenchmarkError(
-            f"[{repr(self)}] is not yet implemented for Apache Solr. "
-            "Port to Solr Backup V2 API: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html"
-        )
+        repository = params.get("repository")
+        if not repository:
+            _backup_location(params)
+            return {"weight": 1, "unit": "ops", "success": True}
+        response = await _run_in_executor(
+            client.raw_request, "GET", "/api/cluster/backups/repositories", None, None)
+        if response.status_code == 404:
+            # Older Solr does not list repositories; the name is validated on first use instead.
+            return {"weight": 1, "unit": "ops", "success": True}
+        response.raise_for_status()
+        known = [entry.get("name") for entry in (response.json().get("repositories") or [])]
+        if known and repository not in known:
+            raise exceptions.DataError(
+                "Backup repository [%s] is not declared in solr.xml. Solr cannot create one at "
+                "run time: add a <repository> element under <backup> and restart the node. "
+                "Known repositories: %s" % (repository, ", ".join(known)))
+        return {"weight": 1, "unit": "ops", "success": True}
 
     def __repr__(self, *args, **kwargs):
         return "create-snapshot-repository"
 
 
-class CreateBackup(Runner):
-    # TODO: Port to Solr — implement using Solr backup/restore V2 API:
-    #   POST /api/collections/{collection}/backups/{name}/versions
-    #   Docs: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html
-    #   Current implementation is OpenSearch-specific and will fail against Solr.
+class DeleteBackupRepository(Runner):
     """
-    Creates a new snapshot repository
+    Accept the removal of a backup repository.
+
+    Nothing is deleted: a Solr repository is configuration, not cluster state, so removing it means
+    editing solr.xml. Deleting the backups themselves is delete-snapshot.
     """
     async def __call__(self, client, params):
-        raise exceptions.BenchmarkError(
-            f"[{repr(self)}] is not yet implemented for Apache Solr. "
-            "Port to Solr Backup V2 API: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html"
-        )
+        return {"weight": 1, "unit": "ops", "success": True}
+
+    def __repr__(self, *args, **kwargs):
+        return "delete-snapshot-repository"
+
+
+class CreateBackup(Runner):
+    """
+    Back a collection up.
+
+    Params:
+      - ``collection``, ``snapshot`` (the backup name)
+      - ``location`` or ``repository`` — where it goes
+      - ``request-timeout`` (default 3600) — how long to wait for the asynchronous call
+    """
+    async def __call__(self, client, params):
+        collection = _get_collection(params)
+        name = params.get("snapshot") or params.get("name")
+        if not name:
+            raise exceptions.DataError("Operation parameter 'snapshot' is missing.")
+        body = {"async": "backup-%s" % name}
+        if params.get("repository"):
+            body["repository"] = params["repository"]
+        else:
+            body["location"] = _backup_location(params)
+
+        response = await _run_in_executor(
+            client.raw_request, "POST",
+            "/api/collections/%s/backups/%s/versions" % (collection, name), body, None)
+        response.raise_for_status()
+        request_id = response.json().get("requestid", body["async"])
+        payload = await _await_collections_api(client, request_id,
+                                              params.get("request-timeout", 3600))
+        shard = next(iter((payload.get("success") or {}).values()), {}).get("response", {})
+        return {
+            "weight": 1,
+            "unit": "ops",
+            "success": True,
+            "index-file-count": shard.get("indexFileCount"),
+            "index-size-mb": shard.get("indexSizeMB"),
+        }
 
     def __repr__(self, *args, **kwargs):
         return "create-snapshot"
 
 
 class WaitForBackupCreate(Runner):
-    # TODO: Port to Solr — implement using Solr backup/restore V2 API:
-    #   POST /api/collections/{collection}/backups/{name}/versions
-    #   Docs: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html
-    #   Current implementation is OpenSearch-specific and will fail against Solr.
+    """
+    Wait until a backup is listed, and report what it holds.
+
+    CreateBackup already waits for its own asynchronous call, so this confirms the result is
+    readable rather than repeating the wait.
+    """
     async def __call__(self, client, params):
-        raise exceptions.BenchmarkError(
-            f"[{repr(self)}] is not yet implemented for Apache Solr. "
-            "Port to Solr Backup V2 API: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html"
-        )
+        query = _backup_query(params)
+        collection = params.get("collection") or params.get("index")
+        if collection:
+            query["collection"] = collection
+        deadline = time.perf_counter() + params.get("request-timeout", 3600)
+        while True:
+            response = await _run_in_executor(
+                client.raw_request, "GET",
+                "/solr/admin/collections?action=LISTBACKUP&" + urllib.parse.urlencode(query),
+                None, None)
+            if response.status_code == 200:
+                backups = response.json().get("backups") or []
+                if backups:
+                    newest = backups[-1]
+                    return {
+                        "weight": 1,
+                        "unit": "ops",
+                        "success": True,
+                        "backup-id": newest.get("backupId"),
+                        "index-file-count": newest.get("indexFileCount"),
+                        "index-size-mb": newest.get("indexSizeMB"),
+                    }
+            if time.perf_counter() > deadline:
+                raise exceptions.BenchmarkError(
+                    "Backup [%s] was not listed within the timeout" % query["name"])
+            await asyncio.sleep(_BACKUP_POLL_INTERVAL)
 
     def __repr__(self, *args, **kwargs):
         return "wait-for-snapshot-create"
 
 
-class RestoreBackup(Runner):
-    # TODO: Port to Solr — implement using Solr backup/restore V2 API:
-    #   POST /api/collections/{collection}/backups/{name}/versions
-    #   Docs: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html
-    #   Current implementation is OpenSearch-specific and will fail against Solr.
+class DeleteBackup(Runner):
     """
-    Restores a snapshot from an already registered repository
+    Delete a backup.
+
+    Params:
+      - ``snapshot`` (the backup name), ``location`` or ``repository``
+      - ``backup-id`` — delete this backup point; defaults to every one that exists
+      - ``max-num-backup-points`` — instead, keep this many and delete the rest
+
+    A backup name holds one or more backup points, each with its own id, and DELETEBACKUP wants to
+    be told which: backupId for one, maxNumBackupPoints to keep the newest few, or purgeUnused,
+    which only drops index files no remaining backup point references. Passing purgeUnused alone
+    therefore reports success while leaving the backup in place, so when no id is given every
+    backup point is listed and deleted.
     """
     async def __call__(self, client, params):
-        raise exceptions.BenchmarkError(
-            f"[{repr(self)}] is not yet implemented for Apache Solr. "
-            "Port to Solr Backup V2 API: https://solr.apache.org/guide/solr/latest/configuration-guide/backups.html"
-        )
+        base = _backup_query(params)
+        collection = params.get("collection") or params.get("index")
+        if collection:
+            base["collection"] = collection
+
+        if params.get("max-num-backup-points") is not None:
+            targets = [{"maxNumBackupPoints": params["max-num-backup-points"]}]
+        elif params.get("backup-id") is not None:
+            targets = [{"backupId": params["backup-id"]}]
+        else:
+            listing = await _run_in_executor(
+                client.raw_request, "GET",
+                "/solr/admin/collections?action=LISTBACKUP&" + urllib.parse.urlencode(base),
+                None, None)
+            listing.raise_for_status()
+            targets = [{"backupId": entry["backupId"]}
+                       for entry in (listing.json().get("backups") or [])]
+
+        backup_ids = index_files = 0
+        for target in targets:
+            response = await _run_in_executor(
+                client.raw_request, "GET",
+                "/solr/admin/collections?action=DELETEBACKUP&"
+                + urllib.parse.urlencode(dict(base, **target)), None, None)
+            response.raise_for_status()
+            # "deleted" is an object when deleting by maxNumBackupPoints or purgeUnused, and a list
+            # of the removed backup points when deleting by backupId.
+            deleted = response.json().get("deleted") or {}
+            for entry in (deleted if isinstance(deleted, list) else [deleted]):
+                backup_ids += entry.get("numBackupIds") or (1 if "backupId" in entry else 0)
+                index_files += entry.get("numIndexFiles") or 0
+
+        return {
+            "weight": 1,
+            "unit": "ops",
+            "success": True,
+            "deleted-backup-ids": backup_ids,
+            "deleted-index-files": index_files,
+        }
+
+    def __repr__(self, *args, **kwargs):
+        return "delete-snapshot"
+
+
+class RestoreBackup(Runner):
+    """
+    Restore a backup into a collection.
+
+    Params:
+      - ``snapshot`` (the backup name), ``collection`` (the collection to restore into)
+      - ``location`` or ``repository``
+      - ``request-timeout`` (default 3600)
+
+    Solr restores into a collection that does not exist yet, so a workload that restores over its
+    own collection has to delete it first.
+    """
+    async def __call__(self, client, params):
+        collection = _get_collection(params)
+        query = _backup_query(params, collection=collection,
+                              **{"async": "restore-%s" % collection})
+        response = await _run_in_executor(
+            client.raw_request, "GET",
+            "/solr/admin/collections?action=RESTORE&" + urllib.parse.urlencode(query), None, None)
+        response.raise_for_status()
+        request_id = response.json().get("requestid", query["async"])
+        await _await_collections_api(client, request_id, params.get("request-timeout", 3600))
+        return {"weight": 1, "unit": "ops", "success": True}
 
     def __repr__(self, *args, **kwargs):
         return "restore-snapshot"
-
 
 
 class CompositeContext:
