@@ -266,6 +266,58 @@ class SolrAdminClient:
         logger.info("Deleted collection '%s'", name)
 
     # ------------------------------------------------------------------
+    # Aliases
+    # ------------------------------------------------------------------
+
+    def create_alias(self, name: str, collections) -> None:
+        """
+        Point *name* at one or more collections via CREATEALIAS.
+
+        A standard alias spanning several collections searches all of their shards as one whole,
+        which is what a workload written against an index pattern such as ``logs-*`` needs: Solr has
+        no wildcard collection name, and requesting one is a 404.
+
+        Note the asymmetry, since it decides where a workload may use an alias: a search over the
+        alias covers every collection, but an *update* sent to it goes only to the first one, as
+        standard aliases have no logic for distributing documents.
+        """
+        if not isinstance(collections, str):
+            collections = ",".join(collections)
+        resp = self._get_session().get(
+            f"{self.base_url}/solr/admin/collections",
+            params={"action": "CREATEALIAS", "name": name, "collections": collections, "wt": "json"},
+            timeout=self.timeout,
+        )
+        self._raise_for_solr_error(resp, f"create alias '{name}'")
+        logger.info("Created alias '%s' over %s", name, collections)
+
+    def delete_alias(self, name: str, ignore_missing: bool = True) -> None:
+        """Remove an alias via DELETEALIAS, optionally tolerating one that is not there."""
+        resp = self._get_session().get(
+            f"{self.base_url}/solr/admin/collections",
+            params={"action": "DELETEALIAS", "name": name, "wt": "json"},
+            timeout=self.timeout,
+        )
+        if ignore_missing and resp.status_code in (400, 404):
+            body = self._try_parse_json(resp)
+            msg = body.get("error", {}).get("msg", "") if isinstance(body, dict) else ""
+            if "alias" in msg.lower():
+                logger.info("Alias '%s' was not present", name)
+                return
+        self._raise_for_solr_error(resp, f"delete alias '{name}'")
+        logger.info("Deleted alias '%s'", name)
+
+    def list_aliases(self) -> dict:
+        """Return the cluster's aliases as ``{alias: "coll1,coll2"}``."""
+        resp = self._get_session().get(
+            f"{self.base_url}/solr/admin/collections",
+            params={"action": "LISTALIASES", "wt": "json"},
+            timeout=self.timeout,
+        )
+        self._raise_for_solr_error(resp, "list aliases")
+        return self._try_parse_json(resp).get("aliases", {})
+
+    # ------------------------------------------------------------------
     # Cluster status
     # ------------------------------------------------------------------
 
@@ -529,6 +581,15 @@ class SolrClient(RequestContextHolder):  # pylint: disable=too-many-public-metho
 
     def delete_collection(self, name, **kwargs):
         return self._admin.delete_collection(name, **kwargs)
+
+    def create_alias(self, name, collections):
+        return self._admin.create_alias(name, collections)
+
+    def delete_alias(self, name, **kwargs):
+        return self._admin.delete_alias(name, **kwargs)
+
+    def list_aliases(self):
+        return self._admin.list_aliases()
 
     def wait_for_cluster_ready(self, **kwargs):
         return self._admin.wait_for_cluster_ready(**kwargs)

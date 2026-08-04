@@ -78,6 +78,8 @@ def register_default_runners():
     register_runner("wait-for-merges", SolrWaitForMerges(), async_runner=True)
     register_runner("create-collection", SolrCreateCollection(), async_runner=True)
     register_runner("delete-collection", SolrDeleteCollection(), async_runner=True)
+    register_runner("create-alias", SolrCreateAlias(), async_runner=True)
+    register_runner("delete-alias", SolrDeleteAlias(), async_runner=True)
     register_runner("raw-request", RawRequest(), async_runner=True)
     _paginated_runner = SolrPaginatedSearch()
     register_runner("paginated-search", _paginated_runner, async_runner=True)
@@ -1799,6 +1801,62 @@ class SolrDeleteCollection(SolrRunner):
 
     def __str__(self):
         return "solr-delete-collection"
+
+
+# ---------------------------------------------------------------------------
+# Runner: create-alias / delete-alias
+# ---------------------------------------------------------------------------
+
+class SolrCreateAlias(SolrRunner):
+    """
+    Point one name at several collections, so a workload written against an index pattern can run.
+
+    A workload that searches ``logs-*`` has no direct Solr equivalent — there is no wildcard
+    collection name, and asking for one is a 404. A standard alias over the matching collections
+    searches all their shards as one whole, which is the behaviour those operations are after.
+
+    Params:
+      - ``alias``, ``collections`` (list or comma-separated string)
+    """
+
+    async def __call__(self, client, params):
+        sc = client
+        alias = params.get("alias") or params["collection"]
+        collections = params.get("collections")
+        if not collections:
+            raise exceptions.DataError(
+                "create-alias needs a 'collections' parameter naming the collections the alias spans."
+            )
+
+        start = time.perf_counter()
+        await _run_in_executor(sc.create_alias, alias, collections)
+        elapsed = time.perf_counter() - start
+        return {"weight": 1, "unit": "ops", "took": elapsed}
+
+    def __str__(self):
+        return "solr-create-alias"
+
+
+class SolrDeleteAlias(SolrRunner):
+    """
+    Remove an alias.
+
+    Params:
+      - ``alias``, ``ignore-missing`` (bool, default True)
+    """
+
+    async def __call__(self, client, params):
+        sc = client
+        alias = params.get("alias") or params["collection"]
+        ignore_missing = params.get("ignore-missing", True)
+
+        start = time.perf_counter()
+        await _run_in_executor(sc.delete_alias, alias, ignore_missing=ignore_missing)
+        elapsed = time.perf_counter() - start
+        return {"weight": 1, "unit": "ops", "took": elapsed}
+
+    def __str__(self):
+        return "solr-delete-alias"
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,9 @@ from solrorbit.worker_coordinator.runner import (
     _translate_ndjson_batch,
     SolrBulkIndex,
     SolrSearch,
+    SolrCreateAlias,
     SolrCreateCollection,
+    SolrDeleteAlias,
     SolrDeleteCollection,
 )
 from solrorbit.conversion.field import normalize_field_name
@@ -342,6 +344,78 @@ class TestSolrDeleteCollection(unittest.TestCase):
         runner = SolrDeleteCollection()
         # Should not raise
         _run(runner(mock_sc, params))
+
+
+class _RecordingAliasClient:
+    """
+    A stand-in for the admin client that records alias calls.
+
+    Deliberately a real class rather than a Mock: a bare Mock answers to any attribute name, so a
+    runner calling a method that does not exist would still pass. Only the methods the alias runners
+    are supposed to use are defined here, and the recorded aliases are readable state.
+    """
+
+    def __init__(self):
+        self.aliases = {}
+        self.deleted = []
+
+    def create_alias(self, name, collections):
+        if not isinstance(collections, str):
+            collections = ",".join(collections)
+        self.aliases[name] = collections
+
+    def delete_alias(self, name, ignore_missing=True):
+        self.deleted.append((name, ignore_missing))
+        self.aliases.pop(name, None)
+
+
+class TestSolrAlias(unittest.TestCase):
+    """
+    A workload written against an index pattern such as logs-* needs an alias: Solr has no wildcard
+    collection name and asking for one is a 404, while a standard alias over the matching collections
+    searches all of their shards as one whole.
+    """
+
+    def test_create_alias_accepts_a_list(self):
+        client = _RecordingAliasClient()
+        _run(SolrCreateAlias()(client, {"alias": "logs", "collections": ["logs-1", "logs-2"]}))
+        self.assertEqual({"logs": "logs-1,logs-2"}, client.aliases)
+
+    def test_create_alias_accepts_a_comma_separated_string(self):
+        client = _RecordingAliasClient()
+        _run(SolrCreateAlias()(client, {"alias": "logs", "collections": "logs-1,logs-2"}))
+        self.assertEqual({"logs": "logs-1,logs-2"}, client.aliases)
+
+    def test_create_alias_without_collections_is_an_error(self):
+        from solrorbit import exceptions
+        client = _RecordingAliasClient()
+        with self.assertRaises(exceptions.DataError):
+            _run(SolrCreateAlias()(client, {"alias": "logs"}))
+
+    def test_alias_name_may_come_from_the_collection_param(self):
+        # The converter writes the target under "collection" for every other operation, so accepting
+        # it here keeps a converted workload from having to special-case the alias.
+        client = _RecordingAliasClient()
+        _run(SolrCreateAlias()(client, {"collection": "logs", "collections": ["logs-1"]}))
+        self.assertIn("logs", client.aliases)
+
+    def test_delete_alias_passes_ignore_missing_through(self):
+        client = _RecordingAliasClient()
+        _run(SolrCreateAlias()(client, {"alias": "logs", "collections": ["logs-1"]}))
+        _run(SolrDeleteAlias()(client, {"alias": "logs", "ignore-missing": False}))
+        self.assertEqual([("logs", False)], client.deleted)
+        self.assertEqual({}, client.aliases)
+
+    def test_delete_alias_ignores_missing_by_default(self):
+        client = _RecordingAliasClient()
+        _run(SolrDeleteAlias()(client, {"alias": "never-existed"}))
+        self.assertEqual([("never-existed", True)], client.deleted)
+
+    def test_both_runners_are_registered(self):
+        from solrorbit.worker_coordinator.runner import register_default_runners, runner_for
+        register_default_runners()
+        self.assertIsNotNone(runner_for("create-alias"))
+        self.assertIsNotNone(runner_for("delete-alias"))
 
 
 class TestRunnerRegistrationSmoke(unittest.TestCase):
