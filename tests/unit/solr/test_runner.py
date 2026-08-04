@@ -18,10 +18,13 @@
 """Unit tests for Solr runners (solrorbit/worker_coordinator/runner.py)"""
 
 import asyncio
+import json
 import unittest
 from unittest.mock import MagicMock
 
 from solrorbit.worker_coordinator.runner import (
+    _flatten_document,
+    _translate_ndjson_stream,
     _translate_ndjson_batch,
     SolrBulkIndex,
     SolrSearch,
@@ -224,6 +227,70 @@ class TestSolrBulkIndex(unittest.TestCase):
         self.assertEqual(1, mock_sc.add.call_count)
         added_docs = mock_sc.add.call_args[0][1]
         self.assertEqual(3, len(added_docs))
+
+
+class TestFlattenDocument(unittest.TestCase):
+    """
+    Solr documents are flat. noaa nests an eight-field station object with a location object inside
+    it, and writes its *RANGE fields as {gte,lte} pairs — none of which Solr accepts as it stands.
+    """
+
+    def test_a_nested_object_becomes_underscore_joined_fields(self):
+        doc = {"date": "2016-01-01", "station": {"id": "AE1", "elevation": 34.0}}
+        self.assertEqual(
+            {"date": "2016-01-01", "station_id": "AE1", "station_elevation": 34.0},
+            _flatten_document(doc))
+
+    def test_the_names_match_what_query_normalisation_produces(self):
+        # The query side turns station.location.lat into station_location_lat; the two have to agree
+        # or the operations would search fields the documents never wrote.
+        flat = _flatten_document({"station": {"location": {"lat": 25.333, "lon": 55.517}}})
+        self.assertEqual("station_location_lat", normalize_field_name("station.location.lat"))
+        self.assertIn("station_location_lat", flat)
+        self.assertIn("station_location_lon", flat)
+
+    def test_a_lat_lon_object_also_yields_a_spatial_value(self):
+        # A Solr spatial field takes "lat,lon"; the components are kept too, because an RPT field
+        # cannot expose them as a ValueSource.
+        flat = _flatten_document({"station": {"location": {"lat": 25.333, "lon": 55.517}}})
+        self.assertEqual("25.333,55.517", flat["station_location"])
+        self.assertEqual(25.333, flat["station_location_lat"])
+        self.assertEqual(55.517, flat["station_location_lon"])
+
+    def test_an_object_that_is_not_a_point_gets_no_combined_value(self):
+        flat = _flatten_document({"TRANGE": {"gte": 18.8, "lte": 29.3}})
+        self.assertNotIn("TRANGE", flat)
+        self.assertEqual({"TRANGE_gte": 18.8, "TRANGE_lte": 29.3}, flat)
+
+    def test_a_flat_document_is_unchanged(self):
+        doc = {"TAVG": 22.9, "id": "1"}
+        self.assertEqual(doc, _flatten_document(doc))
+
+    def test_a_list_of_objects_is_left_alone(self):
+        # Solr's answer to that is a child document, a different shape than flattening.
+        doc = {"readings": [{"v": 1}, {"v": 2}]}
+        self.assertEqual(doc, _flatten_document(doc))
+
+
+class TestNestedCorpusThroughTheTranslator(unittest.TestCase):
+    def test_a_real_noaa_document_comes_out_flat_and_dated(self):
+        lines = ['{"index": {"_id": "0"}}',
+                 '{"date": "2016-01-01T00:00:00", "TAVG": 22.9, "station": {"id": "AE1", '
+                 '"location": {"lat": 25.333, "lon": 55.517}}, "TRANGE": {"gte": 18.8, "lte": 29.3}}']
+        doc, target = next(iter(_translate_ndjson_stream(lines)))
+        self.assertEqual("AE1", doc["station_id"])
+        self.assertEqual("25.333,55.517", doc["station_location"])
+        self.assertEqual(18.8, doc["TRANGE_gte"])
+        # A timestamp with no zone: OpenSearch reads it as UTC, Solr rejects it outright, so every
+        # noaa document failed to index until the T-separated form was handled alongside the
+        # space-separated one pmc writes.
+        self.assertEqual("2016-01-01T00:00:00Z", doc["date"])
+
+    def test_both_zoneless_timestamp_forms_are_given_a_zone(self):
+        for written in ("2016-01-01 00:00:00", "2016-01-01T00:00:00"):
+            lines = ['{"index": {"_id": "x"}}', json.dumps({"date": written})]
+            doc, _ = next(iter(_translate_ndjson_stream(lines)))
+            self.assertEqual("2016-01-01T00:00:00Z", doc["date"], msg="from %r" % written)
 
 
 class _RecordingBulkClient:

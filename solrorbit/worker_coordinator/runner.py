@@ -1297,16 +1297,54 @@ def _stream_bulk_pairs(first_action_line, lines_iter):
         if not id_found:
             doc["id"] = str(abs(hash(json.dumps(doc, sort_keys=True))))
 
+        doc = _flatten_document(doc)
+
         for key, value in list(doc.items()):
             if isinstance(value, list) and len(value) == 2:
                 if all(isinstance(v, (int, float)) for v in value):
                     doc[key] = f"{value[1]},{value[0]}"
-            elif isinstance(value, str) and len(value) == 19 and value[10] == ' ':
+            elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
+                # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the
+                # zone and rejects the value outright, so every document would fail. pmc writes the
+                # space-separated form and noaa the T-separated one; both mean the same instant.
                 if value[4] == '-' and value[7] == '-' and value[13] == ':' and value[16] == ':':
                     doc[key] = value.replace(' ', 'T') + 'Z'
 
         yield doc, target
         action_line = next(lines_iter, "").strip()
+
+
+def _flatten_document(doc, prefix="", separator="_"):
+    """
+    Flatten a nested document, joining the path with an underscore.
+
+    Solr documents are flat, so a corpus that nests — noaa carries an eight-field ``station`` object
+    with a ``location`` object inside it — cannot be sent as it stands. The name a nested value takes
+    is its path joined by underscores, ``station_location_lat``, which is what field-name
+    normalisation produces on the query side for ``station.location.lat``, so the two agree.
+
+    A geographic point (an object of exactly ``lat`` and ``lon``) is also emitted as one
+    ``"lat,lon"`` string under the parent's own name, since that is what a Solr spatial field takes.
+    The components are kept as well: an RPT field cannot expose them as a ValueSource.
+
+    A list of objects is left alone. Solr's answer to that is a child document, which is a different
+    shape than flattening, and no workload ported so far has one.
+    """
+    if not isinstance(doc, dict):
+        return doc
+
+    out = {}
+    for key, value in doc.items():
+        name = "%s%s%s" % (prefix, separator, key) if prefix else key
+        if isinstance(value, dict):
+            keys = set(value)
+            if keys == {"lat", "lon"}:
+                out[name] = "%s,%s" % (value["lat"], value["lon"])
+            for sub_name, sub_value in _flatten_document(value, name, separator).items():
+                out[sub_name] = sub_value
+        else:
+            out[name] = value
+    return out
 
 
 def _parse_bulk_pairs(first_action_line, lines_iter):
