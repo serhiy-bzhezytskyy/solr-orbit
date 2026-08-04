@@ -1226,7 +1226,7 @@ class SolrBulkIndex(SolrRunner):
 # escaping, so the separator must be a character no unique key can contain. \x01 is measured to work
 # where \x1f, tab and newline return no results.
 _PUBLISHED_ID_SEPARATOR = "\x01"
-_PUBLISHED_IDS_PATTERN = re.compile(r"\{\{published-ids:([^}]+)\}\}")
+_PUBLISHED_IDS_PATTERN = re.compile(r"\$\{published-ids:([^}]+)\}")
 
 
 class SolrSearch(SolrRunner):
@@ -1239,6 +1239,9 @@ class SolrSearch(SolrRunner):
     - ``publish-ids``: inside a composite operation, store the returned documents' unique keys in
       the composite context under this name, so that a later step can query the same documents.
       Requires a ``rows``/``limit`` bound and the unique key in the returned fields.
+    - ``${published-ids:<name>}`` in any string of the operation expands to a terms query over the
+      ids a preceding step published. The ``$`` form is deliberate: workload files are Jinja
+      templates, so ``{{...}}`` would be consumed before the runner ever sees it.
     """
 
     async def __call__(self, client, params):
@@ -1290,7 +1293,7 @@ class SolrSearch(SolrRunner):
     @staticmethod
     def _substitute_published_ids(params, id_field):
         """
-        Replace occurrences of ``{{published-ids:<name>}}`` with the ids a preceding step of the
+        Replace occurrences of ``${published-ids:<name>}`` with the ids a preceding step of the
         same composite operation published under ``<name>``, joined for a Solr terms query.
 
         The ids are read from the composite context, so this is only meaningful inside a composite

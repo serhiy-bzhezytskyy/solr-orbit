@@ -1185,7 +1185,7 @@ class SolrSearchPublishedIdsTests(TestCase):
         async with runner.CompositeContext():
             await r(sc, {"collection": "test", "q": "alternatenames:street", "rows": 2,
                          "publish-ids": "sample"})
-            await r(sc, {"collection": "test", "q": "{{published-ids:sample}}"})
+            await r(sc, {"collection": "test", "q": "${published-ids:sample}"})
 
         self.assertEqual("{!terms f=id separator=\x01}1\x012", sc.queries[1])
 
@@ -1205,7 +1205,7 @@ class SolrSearchPublishedIdsTests(TestCase):
         bc = BodyClient([{"id": "7"}])
         async with runner.CompositeContext():
             await r(sc, {"collection": "test", "q": "*:*", "publish-ids": "sample"})
-            await r(bc, {"collection": "test", "body": {"query": "{{published-ids:sample}}", "limit": 0}})
+            await r(bc, {"collection": "test", "body": {"query": "${published-ids:sample}", "limit": 0}})
 
         self.assertEqual("{!terms f=id separator=\x01}7", captured["body"]["query"])
 
@@ -1216,7 +1216,19 @@ class SolrSearchPublishedIdsTests(TestCase):
 
         async with runner.CompositeContext():
             with self.assertRaises(KeyError):
-                await r(sc, {"collection": "test", "q": "{{published-ids:never-published}}"})
+                await r(sc, {"collection": "test", "q": "${published-ids:never-published}"})
+
+    @run_async
+    async def test_the_placeholder_survives_jinja_rendering(self):
+        # Workload files are Jinja templates, so a {{...}} placeholder would be consumed before the
+        # runner ever saw it -- and a name containing ':' makes Jinja fail outright with
+        # "expected token 'end of print statement', got ':'".
+        import jinja2
+
+        source = '{"query": "${published-ids:sample}"}'
+        rendered = jinja2.Environment().from_string(source).render()
+
+        self.assertEqual(source, rendered)
 
     @run_async
     async def test_the_id_field_is_configurable(self):
