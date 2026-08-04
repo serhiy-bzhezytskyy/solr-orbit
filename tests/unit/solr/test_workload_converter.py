@@ -34,6 +34,7 @@ from solrorbit.conversion.workload_converter import (
 from solrorbit.conversion.query import (
     translate_to_solr_json_dsl,
     _convert_aggregations_to_facets,
+    _auto_interval_to_solr_gap,
     _calendar_interval_to_solr_gap,
 )
 
@@ -422,6 +423,81 @@ class TestConvertAggregationsToFacets(unittest.TestCase):
         aggs = {"doc_count": {"value_count": {"field": "vendor_id"}}}
         result = _convert_aggregations_to_facets(aggs)
         self.assertEqual("countvals(vendor_id)", result["doc_count"])
+
+
+class TestRangeAggregationWithExplicitRanges(unittest.TestCase):
+    """
+    An explicit list of buckets, each with its own width. Solr's range facet takes the same thing
+    under the same key — this was reported as an unsupported aggregation and dropped, which silently
+    emptied noaa's three range-auto-date-histo operations: the facet vanished and the operation was
+    left as a bare match-all that still looked like it ran.
+    """
+
+    def test_ranges_are_carried_across(self):
+        aggs = {"tmax": {"range": {"field": "TMAX", "ranges": [
+            {"to": -10}, {"from": -10, "to": 0}, {"from": 30}]}}}
+        result = _convert_aggregations_to_facets(aggs)["tmax"]
+        self.assertEqual("range", result["type"])
+        self.assertEqual("TMAX", result["field"])
+        self.assertEqual([{"to": -10}, {"from": -10, "to": 0}, {"from": 30}], result["ranges"])
+        # gap/start/end belong to the fixed-width form and must not be invented here.
+        for key in ("gap", "start", "end"):
+            self.assertNotIn(key, result)
+
+    def test_a_nested_aggregation_survives(self):
+        aggs = {"tmax": {"range": {"field": "TMAX", "ranges": [{"from": 0, "to": 10}]},
+                         "aggs": {"tmin": {"min": {"field": "TMIN"}}}}}
+        result = _convert_aggregations_to_facets(aggs)["tmax"]
+        self.assertEqual({"tmin": "min(TMIN)"}, result["facet"])
+
+    def test_a_range_agg_listing_nothing_is_skipped(self):
+        aggs = {"tmax": {"range": {"field": "TMAX", "ranges": []}}}
+        self.assertEqual({}, _convert_aggregations_to_facets(aggs))
+
+
+class TestAutoDateHistogram(unittest.TestCase):
+    """
+    auto_date_histogram states a bucket *target* and lets the engine pick an interval. Solr takes the
+    interval, so it is computed from the same two inputs. It used to skip the whole operation.
+    """
+
+    def test_the_interval_comes_from_the_span_and_the_target(self):
+        year = ("2016-01-01T00:00:00Z", "2017-01-01T00:00:00Z")
+        # A year over 20 buckets wants ~18 days; the coarsest ladder step that fits is a month.
+        self.assertEqual("+1MONTH", _auto_interval_to_solr_gap(20, year))
+        # A year over 400 buckets wants ~22 hours, so a day.
+        self.assertEqual("+1DAY", _auto_interval_to_solr_gap(400, year))
+        # A year over 2 buckets wants half a year, above every step, so the coarsest.
+        self.assertEqual("+1YEAR", _auto_interval_to_solr_gap(2, year))
+
+    def test_without_bounds_the_coarsest_interval_is_chosen(self):
+        # A fine gap over an unknown range would produce a bucket per document.
+        self.assertEqual("+1YEAR", _auto_interval_to_solr_gap(20, None))
+        self.assertEqual("+1YEAR", _auto_interval_to_solr_gap(
+            20, ("REPLACE_WITH_CORPUS_START", "REPLACE_WITH_CORPUS_END")))
+
+    def test_a_nonsense_target_falls_back_rather_than_raising(self):
+        # The fallback target is 10 buckets, so a year wants ~37 days and the ladder gives a quarter.
+        year = ("2016-01-01T00:00:00Z", "2017-01-01T00:00:00Z")
+        self.assertEqual("+3MONTHS", _auto_interval_to_solr_gap("not a number", year))
+        self.assertEqual("+3MONTHS", _auto_interval_to_solr_gap(None, year))
+
+    def test_it_converts_instead_of_being_skipped(self):
+        aggs = {"date": {"auto_date_histogram": {"field": "date", "buckets": 20}}}
+        result = _convert_aggregations_to_facets(
+            aggs, ("2016-01-01T00:00:00Z", "2017-01-01T00:00:00Z"))
+        self.assertEqual("range", result["date"]["type"])
+        self.assertEqual("+1MONTH", result["date"]["gap"])
+        self.assertEqual("2016-01-01T00:00:00Z", result["date"]["start"])
+
+    def test_nested_inside_a_range_aggregation(self):
+        # noaa's actual shape: an explicit range list with an auto histogram inside each bucket.
+        aggs = {"tmax": {"range": {"field": "TMAX", "ranges": [{"from": 0, "to": 10}]},
+                         "aggs": {"date": {"auto_date_histogram": {"field": "date", "buckets": 20}}}}}
+        result = _convert_aggregations_to_facets(
+            aggs, ("2016-01-01T00:00:00Z", "2017-01-01T00:00:00Z"))
+        self.assertEqual([{"from": 0, "to": 10}], result["tmax"]["ranges"])
+        self.assertEqual("+1MONTH", result["tmax"]["facet"]["date"]["gap"])
 
 
 class TestCalendarIntervalToSolrGap(unittest.TestCase):

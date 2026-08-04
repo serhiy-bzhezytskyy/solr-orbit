@@ -483,18 +483,27 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
                 facet_def["facet"] = sub
         return facet_def
 
-    if "date_histogram" in agg_def:
-        dh_conf = agg_def["date_histogram"]
+    if "date_histogram" in agg_def or "auto_date_histogram" in agg_def:
+        auto = "auto_date_histogram" in agg_def
+        dh_conf = agg_def["auto_date_histogram"] if auto else agg_def["date_histogram"]
         field = normalize_field_name(dh_conf.get("field", ""))
         if not field:
             logger.warning("date_histogram agg '%s' has no field — skipping", agg_name)
             return None
-        interval = (
-            dh_conf.get("calendar_interval")
-            or dh_conf.get("fixed_interval")
-            or dh_conf.get("interval", "month")
-        )
-        gap = _calendar_interval_to_solr_gap(interval)
+        if auto:
+            # auto_date_histogram states a bucket *target* and lets the engine choose an interval that
+            # lands near it. Solr's range facet takes the interval, so the interval is computed here
+            # from the same two inputs the engine uses: the range being covered and the target count.
+            # That makes it deterministic rather than adaptive — which is what a Solr-to-Solr
+            # comparison wants anyway, and matches how the earlier workloads carried this aggregation.
+            gap = _auto_interval_to_solr_gap(dh_conf.get("buckets", 10), date_bounds)
+        else:
+            interval = (
+                dh_conf.get("calendar_interval")
+                or dh_conf.get("fixed_interval")
+                or dh_conf.get("interval", "month")
+            )
+            gap = _calendar_interval_to_solr_gap(interval)
         start, end = (date_bounds[0], date_bounds[1]) if date_bounds else (None, None)
         if not start or not end:
             # A guess here is worse than an obvious placeholder: bounds that miss the corpus give an
@@ -513,6 +522,37 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
             "start": start,
             "end": end,
         }
+        nested = agg_def.get("aggs") or agg_def.get("aggregations")
+        if nested:
+            sub = _convert_aggregations_to_facets(nested, date_bounds)
+            if sub:
+                facet_def["facet"] = sub
+        return facet_def
+
+    if "range" in agg_def:
+        # An explicit list of buckets, each with its own width. Solr's range facet takes the same
+        # thing under the same key, and the inclusivity defaults line up: both engines include the
+        # lower bound and exclude the upper. An omitted bound means unbounded on both sides.
+        r_conf = agg_def["range"]
+        field = normalize_field_name(r_conf.get("field", ""))
+        if not field:
+            logger.warning("range agg '%s' has no field — skipping", agg_name)
+            return None
+        ranges = []
+        for entry in r_conf.get("ranges") or []:
+            if not isinstance(entry, dict):
+                continue
+            bucket = {}
+            if "from" in entry:
+                bucket["from"] = entry["from"]
+            if "to" in entry:
+                bucket["to"] = entry["to"]
+            if bucket:
+                ranges.append(bucket)
+        if not ranges:
+            logger.warning("range agg '%s' lists no ranges — skipping", agg_name)
+            return None
+        facet_def = {"type": "range", "field": field, "ranges": ranges}
         nested = agg_def.get("aggs") or agg_def.get("aggregations")
         if nested:
             sub = _convert_aggregations_to_facets(nested, date_bounds)
@@ -578,6 +618,60 @@ def _calendar_interval_to_solr_gap(interval: str) -> str:
         "1y": "+1YEAR",
     }
     return mapping.get(str(interval).lower(), "+1MONTH")
+
+
+def _auto_interval_to_solr_gap(target_buckets, date_bounds) -> str:
+    """
+    Choose the interval an ``auto_date_histogram`` would settle on, as a Solr range gap.
+
+    OpenSearch is given a bucket *target* and picks an interval from a fixed ladder — the coarsest one
+    that keeps the bucket count at or under the target. The same choice is made here, from the same
+    two inputs: the range the query covers and the target. It is a deterministic interval rather than
+    an adaptive one, which is what a range facet needs and what a Solr-to-Solr comparison wants.
+
+    Without bounds there is nothing to divide, so the safe answer is the ladder's coarsest step: a gap
+    too fine over an unknown range produces a facet with a bucket per document.
+    """
+    ladder = [
+        (1, "+1SECOND"), (5, "+5SECONDS"), (10, "+10SECONDS"), (30, "+30SECONDS"),
+        (60, "+1MINUTE"), (300, "+5MINUTES"), (600, "+10MINUTES"), (1800, "+30MINUTES"),
+        (3600, "+1HOUR"), (10800, "+3HOURS"), (43200, "+12HOURS"),
+        (86400, "+1DAY"), (604800, "+7DAYS"),
+        (2592000, "+1MONTH"), (7776000, "+3MONTHS"), (31536000, "+1YEAR"),
+    ]
+    try:
+        target = max(1, int(target_buckets))
+    except (TypeError, ValueError):
+        target = 10
+
+    span = None
+    if date_bounds and date_bounds[0] and date_bounds[1]:
+        span = _date_span_seconds(date_bounds[0], date_bounds[1])
+    if not span:
+        return ladder[-1][1]
+
+    wanted = span / target
+    for seconds, gap in ladder:
+        if seconds >= wanted:
+            return gap
+    return ladder[-1][1]
+
+
+def _date_span_seconds(start, end):
+    """Seconds between two ISO-8601 instants, or None if either is not one (a placeholder, say)."""
+    import datetime
+
+    def parse(value):
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            return datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+    lo, hi = parse(start), parse(end)
+    if lo is None or hi is None or hi <= lo:
+        return None
+    return (hi - lo).total_seconds()
 
 
 def _convert_date_to_solr_format(date_str, os_format=None) -> str:

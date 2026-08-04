@@ -898,19 +898,22 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
         skipped.append(op_name)
         return False
 
-    # auto_date_histogram has no Solr equivalent — skip the whole operation.
+    # auto_date_histogram used to be skipped here as unsupported. It is not: the aggregation states a
+    # bucket *target* and lets the engine choose an interval, and a Solr range facet takes the interval
+    # directly — so the interval is computed from the same inputs the engine uses, in
+    # _auto_interval_to_solr_gap. The earlier workloads carry four of these operations that way, hand
+    # written, and this makes the converter produce the same shape. What differs is that Solr's
+    # interval is fixed where OpenSearch's adapts; noted where the operations are recorded.
     if op_type in ("search", "paginated-search", "scroll-search"):
         body = op.get("body")
         if isinstance(body, dict):
             aggs = body.get("aggs") or body.get("aggregations") or {}
             if _has_auto_date_histogram(aggs):
-                logger.warning(
-                    "Skipping operation '%s': auto_date_histogram is not supported in Solr "
-                    "(Solr requires explicit gap/start/end for range facets).",
+                logger.info(
+                    "Operation '%s' uses auto_date_histogram: converting to a range facet with a "
+                    "computed interval, since Solr takes an interval rather than a bucket target.",
                     op_name,
                 )
-                skipped.append(f"{op_name} (auto_date_histogram not supported in Solr)")
-                return False
 
     new_type = _OP_MAP.get(op_type)
     if new_type and new_type != op_type:
