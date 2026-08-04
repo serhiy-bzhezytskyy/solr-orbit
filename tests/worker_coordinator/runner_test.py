@@ -1128,3 +1128,154 @@ class SolrPaginatedSearchTests(TestCase):
 
         self.assertEqual(1, result["pages"])
         self.assertEqual(30, result["hits"])
+class SolrSearchPublishedIdsTests(TestCase):
+    """A search step can hand the ids it matched to a later step of the same composite operation."""
+
+    class FakeResults:
+        def __init__(self, docs):
+            self.docs = docs
+            self.hits = len(docs)
+
+    class FakeSolrClient:
+        def __init__(self, docs):
+            self.docs = docs
+            self.queries = []
+
+        def search(self, collection, q, **kwargs):
+            self.queries.append(q)
+            return SolrSearchPublishedIdsTests.FakeResults(self.docs)
+
+    @run_async
+    async def test_publishes_the_matched_ids(self):
+        sc = self.FakeSolrClient([{"id": "1"}, {"id": "2"}, {"id": "3"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "*:*", "rows": 3, "publish-ids": "sample"})
+
+            self.assertEqual(["1", "2", "3"], runner.CompositeContext.get("sample"))
+
+    @run_async
+    async def test_publishes_nothing_when_not_asked(self):
+        sc = self.FakeSolrClient([{"id": "1"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "*:*"})
+
+            # CompositeContext.get raises KeyError for a name that was never published
+            with self.assertRaises(KeyError):
+                runner.CompositeContext.get("sample")
+
+    @run_async
+    async def test_skips_documents_without_the_id_field(self):
+        sc = self.FakeSolrClient([{"id": "1"}, {"name": "no id here"}, {"id": "3"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "*:*", "publish-ids": "sample"})
+
+            self.assertEqual(["1", "3"], runner.CompositeContext.get("sample"))
+
+    @run_async
+    async def test_a_later_step_queries_the_published_ids(self):
+        sc = self.FakeSolrClient([{"id": "1"}, {"id": "2"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "alternatenames:street", "rows": 2,
+                         "publish-ids": "sample"})
+            await r(sc, {"collection": "test", "q": "{{published-ids:sample}}"})
+
+        self.assertEqual("{!terms f=id separator=\x01}1\x012", sc.queries[1])
+
+    @run_async
+    async def test_substitution_reaches_a_json_body(self):
+        sc = self.FakeSolrClient([{"id": "7"}])
+        r = runner.SolrSearch()
+        captured = {}
+
+        class BodyClient(self.FakeSolrClient):
+            def raw_request(self, method, path, body, headers):
+                captured["body"] = body
+                resp = mock.MagicMock()
+                resp.json.return_value = {"response": {"numFound": 1, "docs": [{"id": "7"}]}}
+                return resp
+
+        bc = BodyClient([{"id": "7"}])
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "*:*", "publish-ids": "sample"})
+            await r(bc, {"collection": "test", "body": {"query": "{{published-ids:sample}}", "limit": 0}})
+
+        self.assertEqual("{!terms f=id separator=\x01}7", captured["body"]["query"])
+
+    @run_async
+    async def test_a_missing_name_is_reported(self):
+        sc = self.FakeSolrClient([{"id": "1"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            with self.assertRaises(KeyError):
+                await r(sc, {"collection": "test", "q": "{{published-ids:never-published}}"})
+
+    @run_async
+    async def test_the_id_field_is_configurable(self):
+        sc = self.FakeSolrClient([{"geonameid": "42"}])
+        r = runner.SolrSearch()
+
+        async with runner.CompositeContext():
+            await r(sc, {"collection": "test", "q": "*:*", "publish-ids": "sample",
+                         "id-field": "geonameid"})
+
+            self.assertEqual(["42"], runner.CompositeContext.get("sample"))
+
+class SolrRunnerTimingBoundaryTests(TestCase):
+    """
+    Every Solr runner has to report both timing layers, or a composite operation cannot be
+    measured: update_request_start() ignores its value unless a client_request_start was seen
+    first, so RequestTiming ends up computing service_time from two Nones.
+    """
+
+    class FakeResults:
+        docs = []
+        hits = 0
+
+    class FakeSolrClient:
+        def search(self, collection, q, **kwargs):
+            return SolrRunnerTimingBoundaryTests.FakeResults()
+
+    @run_async
+    async def test_a_search_records_both_boundaries(self):
+        client = self.FakeSolrClient()
+
+        async with runner.request_context_holder.new_request_context() as ctx:
+            await runner.SolrSearch()(client, {"collection": "test", "q": "*:*"})
+
+        self.assertIsNotNone(ctx.request_start, "request_start was not recorded")
+        self.assertIsNotNone(ctx.request_end, "request_end was not recorded")
+        self.assertIsNotNone(ctx.client_request_start)
+        self.assertIsNotNone(ctx.client_request_end)
+
+    @run_async
+    async def test_service_time_is_computable(self):
+        client = self.FakeSolrClient()
+
+        async with runner.request_context_holder.new_request_context() as ctx:
+            await runner.SolrSearch()(client, {"collection": "test", "q": "*:*"})
+
+        self.assertGreaterEqual(ctx.request_end - ctx.request_start, 0)
+
+    @run_async
+    async def test_a_runner_works_without_a_request_context(self):
+        # Called outside a request context there is nothing to record, and that must not raise.
+        result = await runner.SolrSearch()(self.FakeSolrClient(), {"collection": "test", "q": "*:*"})
+
+        self.assertEqual(0, result["hits"])
+
+    @run_async
+    async def test_the_composite_client_mapping_is_unwrapped(self):
+        # Composite hands each step {"default": client}; the runner must see the client itself.
+        result = await runner.SolrSearch()({"default": self.FakeSolrClient()},
+                                           {"collection": "test", "q": "*:*"})
+
+        self.assertEqual(0, result["hits"])

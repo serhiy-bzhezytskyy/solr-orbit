@@ -29,6 +29,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import sys
 import time
 import types
@@ -839,17 +840,48 @@ def _translate_solr_error(e):
 
 
 def _solr_runner_decorator(fn):
-    """Decorator that translates pysolr/requests exceptions to BenchmarkTransportError."""
+    """
+    Decorator applied to every Solr runner's ``__call__``.
+
+    Translates pysolr and requests exceptions to BenchmarkTransportError, and records the timing
+    boundaries every runner has to report.
+
+    It also unwraps the client mapping a composite operation passes down, so that the same runner
+    serves both call shapes.
+
+    Two nested pairs are needed, and both are required for a composite operation to be measurable.
+    The outer pair brackets the whole call; the inner pair brackets the request itself.
+    update_request_start() ignores its value unless a client_request_start has already been seen
+    (context.py), so marking only the inner pair records nothing and RequestTiming then computes
+    service_time from two Nones.
+    """
     import functools
 
     @functools.wraps(fn)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(self, client, *args, **kwargs):
+        # A composite operation hands its steps the mapping {"default": client}; unwrap it so that
+        # every runner sees the client itself and works inside and outside a composite alike.
+        if isinstance(client, dict) and "default" in client:
+            client = client["default"]
+        # There is no request context when a runner is called outside one, e.g. from a test.
         try:
-            return await fn(*args, **kwargs)
+            request_context_holder.request_context.get()
+            timed = True
+        except LookupError:
+            timed = False
+        if timed:
+            request_context_holder.on_client_request_start()
+            request_context_holder.on_request_start()
+        try:
+            return await fn(self, client, *args, **kwargs)
         except exceptions.BenchmarkTransportError:
             raise
         except (pysolr.SolrError, requests.exceptions.RequestException) as e:
             raise _translate_solr_error(e) from e
+        finally:
+            if timed:
+                request_context_holder.on_request_end()
+                request_context_holder.on_client_request_end()
     return wrapper
 
 
@@ -1190,6 +1222,13 @@ class SolrBulkIndex(SolrRunner):
 # Runner: search
 # ---------------------------------------------------------------------------
 
+# Solr's terms query parser splits its value on the separator with a plain str.split() and has no
+# escaping, so the separator must be a character no unique key can contain. \x01 is measured to work
+# where \x1f, tab and newline return no results.
+_PUBLISHED_ID_SEPARATOR = "\x01"
+_PUBLISHED_IDS_PATTERN = re.compile(r"\{\{published-ids:([^}]+)\}\}")
+
+
 class SolrSearch(SolrRunner):
     """
     Execute a Solr search query.
@@ -1197,14 +1236,22 @@ class SolrSearch(SolrRunner):
     - Classic Solr params: ``q``, ``fl``, ``rows``, ``fq``, ``sort``, ``request-params``
     - Solr JSON Query body: when ``body`` is present, POSTs it to ``/solr/{collection}/query``
       using the `Solr JSON Request API <https://solr.apache.org/guide/solr/latest/query-guide/json-request-api.html>`_.
+    - ``publish-ids``: inside a composite operation, store the returned documents' unique keys in
+      the composite context under this name, so that a later step can query the same documents.
+      Requires a ``rows``/``limit`` bound and the unique key in the returned fields.
     """
 
     async def __call__(self, client, params):
         collection = _get_collection(params)
         sc = client
+        publish_ids = params.get("publish-ids")
+        id_field = params.get("id-field", "id")
+
+        params = self._substitute_published_ids(params, id_field)
 
         start = time.perf_counter()
 
+        docs = None
         body = params.get("body")
         if body is not None:
             resp = await _run_in_executor(
@@ -1212,7 +1259,9 @@ class SolrSearch(SolrRunner):
                 {"Content-Type": "application/json"}
             )
             resp.raise_for_status()
-            num_hits = resp.json().get("response", {}).get("numFound", 0)
+            response = resp.json().get("response", {})
+            num_hits = response.get("numFound", 0)
+            docs = response.get("docs")
         else:
             q = params.get("q", "*:*")
             kwargs = {}
@@ -1223,8 +1272,12 @@ class SolrSearch(SolrRunner):
 
             results = await _run_in_executor(sc.search, collection, q, **kwargs)
             num_hits = results.hits
+            docs = results.docs
 
         elapsed = time.perf_counter() - start
+
+        if publish_ids:
+            CompositeContext.put(publish_ids, [doc[id_field] for doc in (docs or []) if id_field in doc])
 
         return {
             "weight": 1,
@@ -1233,6 +1286,32 @@ class SolrSearch(SolrRunner):
             "hits-total": num_hits,
             "took": elapsed,
         }
+
+    @staticmethod
+    def _substitute_published_ids(params, id_field):
+        """
+        Replace occurrences of ``{{published-ids:<name>}}`` with the ids a preceding step of the
+        same composite operation published under ``<name>``, joined for a Solr terms query.
+
+        The ids are read from the composite context, so this is only meaningful inside a composite
+        operation. A separator that no unique key can contain is used, since Solr's terms parser
+        splits on its separator with no escaping.
+        """
+        def render(value):
+            if isinstance(value, str):
+                def replace(match):
+                    ids = CompositeContext.get(match.group(1))
+                    return "{!terms f=%s separator=%s}%s" % (
+                        id_field, _PUBLISHED_ID_SEPARATOR,
+                        _PUBLISHED_ID_SEPARATOR.join(str(i) for i in ids))
+                return _PUBLISHED_IDS_PATTERN.sub(replace, value)
+            if isinstance(value, dict):
+                return {k: render(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [render(v) for v in value]
+            return value
+
+        return render(params)
 
     def __str__(self):
         return "solr-search"
