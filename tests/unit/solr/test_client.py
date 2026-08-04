@@ -292,6 +292,71 @@ class TestSolrAdminClientIsCloudMode(unittest.TestCase):
             client.is_cloud_mode()
 
 
+class TestRunTwiceIdempotency(unittest.TestCase):
+    """
+    A workload has to be able to tear itself down and run again.
+
+    Both of these were measured against a live node: a second run of http_logs spent 60 seconds
+    timing out on each of its fourteen setup tasks, because the collections and the alias from the
+    first run were still there.
+    """
+
+    def _client(self, request_response=None, delete_responses=None):
+        client = SolrAdminClient("localhost")
+        client._session = MagicMock()
+        if request_response is not None:
+            client._session.post.return_value = request_response
+        if delete_responses is not None:
+            client._session.delete.side_effect = delete_responses
+        return client
+
+    def test_configset_upload_overwrites_and_cleans_up(self):
+        # Without overwrite, a second run fails with "The configuration <name> already exists".
+        # Without cleanup, a file the old configset had is left in ZooKeeper, which produced a
+        # configset that read as updated while the running core kept the old chain.
+        import tempfile, os
+        client = self._client(request_response=_make_response(status_code=200, json_data={}))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "solrconfig.xml"), "w") as f:
+                f.write("<config/>")
+            client.upload_configset("cs", tmpdir)
+        params = client._session.post.call_args.kwargs["params"]
+        self.assertEqual("true", params.get("overwrite"))
+        self.assertEqual("true", params.get("cleanup"))
+
+    def test_deleting_an_aliased_collection_drops_the_alias_first(self):
+        # Solr refuses: "is part of aliases: [logs], remove or modify the aliases before removing
+        # this collection".
+        refused = _make_response(
+            status_code=400,
+            json_data={"error": {"msg": "Collection : logs-1 is part of aliases: [logs], remove or "
+                                        "modify the aliases before removing this collection"}})
+        client = self._client(delete_responses=[refused, _make_response(status_code=200, json_data={})])
+        client.list_aliases = MagicMock(return_value={"logs": "logs-1,logs-2"})
+        client.delete_alias = MagicMock()
+        client.delete_collection("logs-1")
+        client.delete_alias.assert_called_once_with("logs")
+        self.assertEqual(2, client._session.delete.call_count, msg="the delete must be retried")
+
+    def test_an_alias_not_naming_this_collection_is_left_alone(self):
+        refused = _make_response(
+            status_code=400,
+            json_data={"error": {"msg": "Collection : logs-1 is part of aliases: [logs]"}})
+        client = self._client(delete_responses=[refused, _make_response(status_code=200, json_data={})])
+        client.list_aliases = MagicMock(return_value={"other": "something-else"})
+        client.delete_alias = MagicMock()
+        client.delete_collection("logs-1")
+        client.delete_alias.assert_not_called()
+
+    def test_a_missing_collection_still_raises_not_found(self):
+        # The alias handling must not swallow the case the caller relies on for ignore-missing.
+        missing = _make_response(
+            status_code=400, json_data={"error": {"msg": "Could not find collection : logs-9"}})
+        client = self._client(delete_responses=[missing])
+        with self.assertRaises(CollectionNotFoundError):
+            client.delete_collection("logs-9")
+
+
 class TestRawRequestBody(unittest.TestCase):
     """
     A binary body has to reach the wire.

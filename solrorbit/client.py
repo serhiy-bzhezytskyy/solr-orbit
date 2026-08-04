@@ -174,6 +174,16 @@ class SolrAdminClient:
         The directory must contain a conf/ sub-directory with at minimum
         schema.xml (or managed-schema) and solrconfig.xml.
 
+        The upload overwrites an existing configset of the same name and cleans up files the new one
+        does not have. Both matter for a workload that is run more than once:
+
+        - Without ``overwrite`` the second run fails outright with "The configuration <name> already
+          exists", which is not a useful way to end a benchmark.
+        - Without ``cleanup`` a file the previous configset had and this one does not is left behind
+          in ZooKeeper. That produced a configset that looked updated and was not: ``admin/file``
+          served the new solrconfig.xml while ``/config`` and the running core kept the old chain,
+          through both a RELOAD and a DELETE plus CREATE.
+
         Args:
             name:           Configset name to register on the cluster.
             configset_dir:  Local path to the directory containing conf/.
@@ -181,7 +191,7 @@ class SolrAdminClient:
         zip_bytes = self._build_configset_zip(configset_dir)
         # Use V1 API for configsets (V2 API not available in Solr 9.x)
         url = f"{self.base_url}/solr/admin/configs"
-        params = {"action": "UPLOAD", "name": name}
+        params = {"action": "UPLOAD", "name": name, "overwrite": "true", "cleanup": "true"}
         resp = self._get_session().post(
             url,
             params=params,
@@ -262,6 +272,19 @@ class SolrAdminClient:
             msg = body.get("error", {}).get("msg", "") if isinstance(body, dict) else ""
             if "could not find collection" in msg.lower():
                 raise CollectionNotFoundError(f"Collection '{name}' not found")
+            # Solr refuses to delete a collection an alias still points at: "is part of aliases:
+            # [logs], remove or modify the aliases before removing this collection". A workload that
+            # aliases its collections cannot otherwise tear itself down for a second run, so the
+            # aliases naming this collection go first and the delete is retried once.
+            if "part of aliases" in msg.lower():
+                for alias, targets in (self.list_aliases() or {}).items():
+                    if name in [t.strip() for t in str(targets).split(",")]:
+                        logger.info("Dropping alias '%s' so collection '%s' can be deleted", alias, name)
+                        self.delete_alias(alias)
+                resp = self._get_session().delete(
+                    f"{self.api_url}/collections/{name}",
+                    timeout=self.timeout,
+                )
         self._raise_for_solr_error(resp, f"delete collection '{name}'")
         logger.info("Deleted collection '%s'", name)
 
