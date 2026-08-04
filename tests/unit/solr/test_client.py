@@ -292,5 +292,55 @@ class TestSolrAdminClientIsCloudMode(unittest.TestCase):
             client.is_cloud_mode()
 
 
+class TestRawRequestBody(unittest.TestCase):
+    """
+    A binary body has to reach the wire.
+
+    ⛔ It used to be dropped: only dict and str were handled, so a javabin update was sent with no
+    body at all. Solr answered 200, logged ``params={}{}`` with no documents, and the runner reported
+    success on an update that indexed nothing — a green result for an empty write, which is worse
+    than an error.
+    """
+
+    def _client(self):
+        client = SolrAdminClient("localhost")
+        client._session = MagicMock()
+        client._session.request.return_value = _make_response(status_code=200, json_data={})
+        return client
+
+    def test_bytes_body_is_sent_as_data(self):
+        client = self._client()
+        payload = b"\x02\xc3\xe0&params"
+        client.raw_request("POST", "/solr/c/update", payload, {"Content-type": "application/javabin"})
+        self.assertEqual(payload, client._session.request.call_args.kwargs["data"])
+
+    def test_bytearray_body_is_sent_as_data(self):
+        client = self._client()
+        client.raw_request("POST", "/solr/c/update", bytearray(b"abc"))
+        self.assertEqual(bytearray(b"abc"), client._session.request.call_args.kwargs["data"])
+
+    def test_str_body_is_still_sent_as_data(self):
+        client = self._client()
+        client.raw_request("POST", "/solr/c/update", "<add/>")
+        self.assertEqual("<add/>", client._session.request.call_args.kwargs["data"])
+
+    def test_dict_body_is_still_sent_as_json(self):
+        client = self._client()
+        client.raw_request("POST", "/solr/c/update", {"add": {"doc": {}}})
+        self.assertEqual({"add": {"doc": {}}}, client._session.request.call_args.kwargs["json"])
+
+    def test_no_body_sends_neither(self):
+        client = self._client()
+        client.raw_request("GET", "/solr/admin/info")
+        kwargs = client._session.request.call_args.kwargs
+        self.assertNotIn("data", kwargs)
+        self.assertNotIn("json", kwargs)
+
+    def test_an_unsupported_body_type_raises_rather_than_being_dropped(self):
+        client = self._client()
+        with self.assertRaises(TypeError):
+            client.raw_request("POST", "/solr/c/update", object())
+
+
 if __name__ == "__main__":
     unittest.main()

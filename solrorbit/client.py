@@ -447,16 +447,23 @@ class SolrAdminClient:
         Args:
             method:  HTTP method ("GET", "POST", "DELETE", etc.)
             path:    URL path relative to http://{host}:{port}/ (e.g. "/api/cluster")
-            body:    Request body (dict → serialized as JSON, str → sent as-is)
+            body:    Request body (dict → serialized as JSON, str or bytes → sent as-is)
             headers: Additional request headers
+
+        A ``bytes`` body used to be dropped silently, which is worse than an error: Solr accepted the
+        request, logged ``params={}{}`` with no documents, and the caller saw 200 and reported
+        success on an empty update. Any body type other than the three named now raises.
         """
         url = f"{self.base_url}{path}"
         req_headers = dict(headers or {})
         kwargs = {"timeout": self.timeout, "headers": req_headers}
         if isinstance(body, dict):
             kwargs["json"] = body
-        elif isinstance(body, str):
+        elif isinstance(body, (str, bytes, bytearray)):
             kwargs["data"] = body
+        elif body is not None:
+            raise TypeError(
+                "raw_request body must be a dict, str or bytes, not %s" % type(body).__name__)
         resp = self._get_session().request(method.upper(), url, **kwargs)
         return resp
 

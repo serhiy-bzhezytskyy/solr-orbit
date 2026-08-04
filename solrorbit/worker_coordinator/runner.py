@@ -44,6 +44,7 @@ import requests
 from solrorbit import exceptions, workload
 from solrorbit.client import RequestContextHolder, CollectionAlreadyExistsError, CollectionNotFoundError
 from solrorbit.telemetry import _parse_prometheus_text
+from solrorbit.utils.javabin import encode_update_request
 
 __RUNNERS = {}
 
@@ -80,6 +81,12 @@ def register_default_runners():
     register_runner("delete-collection", SolrDeleteCollection(), async_runner=True)
     register_runner("create-alias", SolrCreateAlias(), async_runner=True)
     register_runner("delete-alias", SolrDeleteAlias(), async_runner=True)
+    # A binary indexing transport, which is what a workload's gRPC operations are measuring. Solr has
+    # no gRPC endpoint; its comparable formats are javabin and CBOR on the same /update handler. The
+    # converted spelling is kept so an OpenSearch workload loads unchanged.
+    _binary_bulk = SolrBinaryBulkIndex()
+    register_runner("binary-bulk-index", _binary_bulk, async_runner=True)
+    register_runner("proto-bulk", _binary_bulk, async_runner=True)
     register_runner("raw-request", RawRequest(), async_runner=True)
     _paginated_runner = SolrPaginatedSearch()
     register_runner("paginated-search", _paginated_runner, async_runner=True)
@@ -1453,6 +1460,132 @@ class SolrBulkIndex(SolrRunner):
 
     def __str__(self):
         return "solr-bulk-index"
+
+
+# ---------------------------------------------------------------------------
+# Runner: binary-bulk-index (javabin / CBOR)
+# ---------------------------------------------------------------------------
+
+# Solr's UpdateRequestHandler registers a loader per content type, so the same /update endpoint takes
+# a binary body. These are the two binary formats it accepts.
+_BINARY_UPDATE_FORMATS = ("javabin", "cbor")
+
+
+class SolrBinaryBulkIndex(SolrRunner):
+    """
+    Index documents through Solr's binary update formats rather than JSON.
+
+    A workload may compare a binary indexing transport against JSON — http_logs does, via its gRPC
+    operations. Solr has no gRPC endpoint, but ``UpdateRequestHandler`` registers
+    ``application/javabin`` and ``application/cbor`` next to ``application/json``, so the comparable
+    measurement is the same documents over the same endpoint in a binary encoding.
+
+    Params:
+      - ``collection``, ``bulk-size`` (default 500), ``commit`` (default False)
+      - ``document-format`` — ``javabin`` (default) or ``cbor``
+      - ``body`` or ``corpus`` — NDJSON line pairs, as for ``bulk-index``
+
+    ⚠️ ``commit`` goes in the query string, not the body: measured against a live node, a javabin
+    request carrying ``commit`` in its params returned 200 and logged the adds while leaving the
+    documents invisible.
+    """
+
+    async def __call__(self, client, params):
+        body = params.get("body", params.get("corpus", []))
+        if isinstance(body, bytes):
+            corpus_lines = [line.decode("utf-8") for line in body.split(b"\n") if line]
+        elif isinstance(body, str):
+            corpus_lines = [line for line in body.split("\n") if line]
+        else:
+            corpus_lines = body
+
+        fmt = params.get("document-format", "javabin").lower()
+        if fmt not in _BINARY_UPDATE_FORMATS:
+            raise exceptions.DataError(
+                "Unknown document-format '%s' for a binary update; Solr accepts %s."
+                % (fmt, " and ".join(_BINARY_UPDATE_FORMATS))
+            )
+        if fmt == "cbor":
+            try:
+                import cbor2
+            except ImportError as exc:
+                raise exceptions.SystemSetupError(
+                    "The cbor2 package is needed to index in CBOR format; install it or use "
+                    "document-format=javabin."
+                ) from exc
+
+        batch_size = params.get("bulk-size", 500)
+        do_commit = params.get("commit", False)
+        collection = params.get("collection") or params.get("index")
+        sc = client
+
+        total_docs = 0
+        errors = 0
+        start = time.perf_counter()
+
+        def encode(docs):
+            if fmt == "cbor":
+                import cbor2
+                return cbor2.dumps(docs), "application/cbor"
+            return encode_update_request(docs), "application/javabin"
+
+        async def flush(target, docs, final=False):
+            nonlocal total_docs, errors
+            payload, content_type = encode(docs)
+            if not payload:
+                # An empty body is not a successful update. A dropped body once produced 200 with
+                # nothing indexed, and the runner reported success on it.
+                raise exceptions.BenchmarkError(
+                    "Encoding %d documents as %s produced an empty body" % (len(docs), fmt))
+            path = "/solr/%s/update" % urllib.parse.quote(target)
+            try:
+                resp = await _run_in_executor(
+                    sc.raw_request, "POST", path, payload, {"Content-type": content_type})
+                if resp.status_code >= 400:
+                    raise exceptions.BenchmarkError(
+                        "Binary update returned %d: %s" % (resp.status_code, resp.text[:200]))
+                total_docs += len(docs)
+            except Exception as exc:
+                logging.getLogger(__name__).error(
+                    "Binary (%s) index error on %sbatch for '%s': %s",
+                    fmt, "final " if final else "", target, exc)
+                errors += len(docs)
+
+        # Batched per target, as bulk-index does: a corpus may name a collection per document set.
+        batches = {}
+        for doc, target in _translate_ndjson_stream(corpus_lines):
+            target = target or collection
+            if not target:
+                raise exceptions.DataError(
+                    "Neither the operation nor the corpus names a collection to index into. Give the "
+                    "operation a 'collection' param, or a 'target-collection' to each document set."
+                )
+            batch = batches.setdefault(target, [])
+            batch.append(doc)
+            if len(batch) >= batch_size:
+                await flush(target, batch)
+                batches[target] = []
+
+        for target, batch in batches.items():
+            if batch:
+                await flush(target, batch, final=True)
+
+        if do_commit:
+            for target in (batches or {collection: None}):
+                await _run_in_executor(sc.commit, target)
+
+        elapsed = time.perf_counter() - start
+        return {
+            "weight": total_docs if total_docs else 1,
+            "unit": "docs",
+            "bulk-size": total_docs,
+            "success": errors == 0,
+            "error-count": errors,
+            "took": elapsed,
+        }
+
+    def __str__(self):
+        return "solr-binary-bulk-index"
 
 
 # ---------------------------------------------------------------------------
