@@ -225,6 +225,88 @@ class TestSolrBulkIndex(unittest.TestCase):
         self.assertEqual(3, len(added_docs))
 
 
+class _RecordingBulkClient:
+    """
+    Records which collection each batch went to.
+
+    A real class rather than a Mock, so a call to a method the runner is not supposed to use fails
+    instead of quietly succeeding.
+    """
+
+    def __init__(self):
+        self.batches = []      # (collection, [ids])
+        self.committed = []
+
+    def add(self, collection, docs, **kwargs):
+        self.batches.append((collection, [d.get("id") for d in docs]))
+
+    def commit(self, collection, **kwargs):
+        self.committed.append(collection)
+
+
+class TestSolrBulkIndexTargets(unittest.TestCase):
+    """
+    A workload can feed several collections from one corpus — http_logs has a document set per
+    month, each with its own target-collection — and the bulk action line is where that target
+    arrives. Reading only _id from it sent all 247M documents to whichever collection the operation
+    happened to name.
+    """
+
+    def _params(self, lines, **extra):
+        return {"host": "localhost", "port": 8983, "corpus": lines, "bulk-size": 500, **extra}
+
+    def test_documents_go_to_the_collection_their_action_line_names(self):
+        client = _RecordingBulkClient()
+        lines = [
+            '{"index": {"_index": "logs-181998", "_id": "a"}}', '{"status": 200}',
+            '{"index": {"_index": "logs-191998", "_id": "b"}}', '{"status": 404}',
+            '{"index": {"_index": "logs-181998", "_id": "c"}}', '{"status": 200}',
+        ]
+        _run(SolrBulkIndex()(client, self._params(lines, collection="ignored")))
+        by_collection = {c: ids for c, ids in client.batches}
+        self.assertEqual({"logs-181998": ["a", "c"], "logs-191998": ["b"]}, by_collection)
+
+    def test_operation_collection_is_the_fallback_when_the_action_names_none(self):
+        client = _RecordingBulkClient()
+        lines = ['{"index": {"_id": "a"}}', '{"status": 200}']
+        _run(SolrBulkIndex()(client, self._params(lines, collection="fallback")))
+        self.assertEqual([("fallback", ["a"])], client.batches)
+
+    def test_plain_ndjson_uses_the_operation_collection(self):
+        client = _RecordingBulkClient()
+        _run(SolrBulkIndex()(client, self._params(['{"id": "a", "status": 200}'], collection="plain")))
+        self.assertEqual(["plain"], [c for c, _ in client.batches])
+
+    def test_no_collection_anywhere_is_an_error(self):
+        from solrorbit import exceptions
+        client = _RecordingBulkClient()
+        lines = ['{"index": {"_id": "a"}}', '{"status": 200}']
+        with self.assertRaises(exceptions.DataError):
+            _run(SolrBulkIndex()(client, self._params(lines)))
+
+    def test_commit_reaches_every_collection_written_to(self):
+        client = _RecordingBulkClient()
+        lines = [
+            '{"index": {"_index": "logs-181998", "_id": "a"}}', '{"status": 200}',
+            '{"index": {"_index": "logs-191998", "_id": "b"}}', '{"status": 404}',
+        ]
+        _run(SolrBulkIndex()(client, self._params(lines, collection="ignored", commit=True)))
+        self.assertEqual({"logs-181998", "logs-191998"}, set(client.committed))
+
+    def test_a_full_batch_flushes_per_collection(self):
+        # bulk-size counts per target, so two collections each reaching the size flush separately
+        # rather than one flush of the combined count.
+        client = _RecordingBulkClient()
+        lines = []
+        for i in range(4):
+            coll = "logs-181998" if i % 2 == 0 else "logs-191998"
+            lines += ['{"index": {"_index": "%s", "_id": "%d"}}' % (coll, i), '{"status": 200}']
+        _run(SolrBulkIndex()(client, self._params(lines, collection="ignored", **{"bulk-size": 2})))
+        # Each collection gets exactly its own two documents, in one flush each.
+        self.assertEqual([("logs-181998", ["0", "2"]), ("logs-191998", ["1", "3"])],
+                         sorted(client.batches))
+
+
 class TestSolrSearch(unittest.TestCase):
     def _base_params(self):
         return {

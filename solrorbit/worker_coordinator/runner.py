@@ -1188,7 +1188,11 @@ def _translate_ndjson_stream(lines):
     """
     Stream-translate NDJSON to Solr documents (generator version).
 
-    Yields documents one at a time instead of loading all into memory.
+    Yields ``(document, target_collection)`` one pair at a time instead of loading all into memory,
+    where *target_collection* is ``None`` unless the bulk action line named one. It has to be
+    per-document: a workload can feed several collections from one corpus, and a single collection
+    read from the operation params would send everything to whichever it names.
+
     Supports both OpenSearch bulk format and simple NDJSON.
     """
     _logger = logging.getLogger(__name__)
@@ -1217,10 +1221,11 @@ def _translate_ndjson_stream(lines):
     if has_action_keys:
         yield from _stream_bulk_pairs(first_line, it)
     else:
+        # Plain NDJSON carries no action line, so there is no per-document target.
         if isinstance(first_obj, dict):
             if "id" not in first_obj:
                 first_obj["id"] = str(hash(json.dumps(first_obj, sort_keys=True)))
-            yield first_obj
+            yield first_obj, None
         for line in it:
             line = line.strip()
             if not line:
@@ -1234,7 +1239,7 @@ def _translate_ndjson_stream(lines):
                         if isinstance(value, list) and len(value) == 2:
                             if all(isinstance(v, (int, float)) for v in value):
                                 obj[key] = f"{value[1]},{value[0]}"
-                    yield obj
+                    yield obj, None
             except json.JSONDecodeError as exc:
                 _logger.warning("Skipping malformed NDJSON line: %s", exc)
 
@@ -1267,12 +1272,19 @@ def _stream_bulk_pairs(first_action_line, lines_iter):
             continue
 
         id_found = False
+        target = None
         for key in ("index", "create", "update", "delete"):
             if key in action:
                 meta = action[key]
-                if isinstance(meta, dict) and "_id" in meta:
-                    doc["id"] = meta["_id"]
-                    id_found = True
+                if isinstance(meta, dict):
+                    if "_id" in meta:
+                        doc["id"] = meta["_id"]
+                        id_found = True
+                    # The action line names the target, which matters when one corpus feeds several
+                    # collections: http_logs has a document set per month, each with its own
+                    # target-collection, and a single collection taken from the operation params
+                    # would send all 247M documents to the first one.
+                    target = meta.get("_index") or meta.get("_collection")
                 break
 
         if not id_found:
@@ -1286,7 +1298,7 @@ def _stream_bulk_pairs(first_action_line, lines_iter):
                 if value[4] == '-' and value[7] == '-' and value[13] == ':' and value[16] == ':':
                     doc[key] = value.replace(' ', 'T') + 'Z'
 
-        yield doc
+        yield doc, target
         action_line = next(lines_iter, "").strip()
 
 
@@ -1380,7 +1392,9 @@ class SolrBulkIndex(SolrRunner):
 
         batch_size = params.get("bulk-size", 500)
         do_commit = params.get("commit", False)
-        collection = _get_collection(params)
+        # A corpus whose document sets name their own target-collection supplies it per document, so
+        # the operation need not carry one; the error is raised only if neither source has it.
+        collection = params.get("collection") or params.get("index")
         sc = client
 
         doc_stream = _translate_ndjson_stream(corpus_lines)
@@ -1389,28 +1403,41 @@ class SolrBulkIndex(SolrRunner):
 
         start = time.perf_counter()
 
-        batch = []
-        for doc in doc_stream:
-            batch.append(doc)
-            if len(batch) >= batch_size:
-                try:
-                    await _run_in_executor(sc.add, collection, batch, commit=False, commitWithin=1000)
-                    total_docs += len(batch)
-                except pysolr.SolrError as exc:
-                    logging.getLogger(__name__).error("Bulk index error on batch: %s", exc)
-                    errors += len(batch)
-                batch = []
+        # Batched per target: a corpus may name a collection per document set, as http_logs does with
+        # one per month, and sending those to a single collection would put every document in the
+        # first one. A document with no target named falls back to the operation's collection.
+        batches = {}
 
-        if batch:
+        async def flush(target, batch, final=False):
+            nonlocal total_docs, errors
             try:
-                await _run_in_executor(sc.add, collection, batch, commit=False, commitWithin=1000)
+                await _run_in_executor(sc.add, target, batch, commit=False, commitWithin=1000)
                 total_docs += len(batch)
             except pysolr.SolrError as exc:
-                logging.getLogger(__name__).error("Bulk index error on final batch: %s", exc)
+                logging.getLogger(__name__).error(
+                    "Bulk index error on %sbatch for '%s': %s", "final " if final else "", target, exc)
                 errors += len(batch)
 
+        for doc, target in doc_stream:
+            target = target or collection
+            if not target:
+                raise exceptions.DataError(
+                    "Neither the operation nor the corpus names a collection to index into. Give the "
+                    "operation a 'collection' param, or a 'target-collection' to each document set."
+                )
+            batch = batches.setdefault(target, [])
+            batch.append(doc)
+            if len(batch) >= batch_size:
+                await flush(target, batch)
+                batches[target] = []
+
+        for target, batch in batches.items():
+            if batch:
+                await flush(target, batch, final=True)
+
         if do_commit:
-            await _run_in_executor(sc.commit, collection)
+            for target in (batches or {collection: None}):
+                await _run_in_executor(sc.commit, target)
 
         elapsed = time.perf_counter() - start
         weight = total_docs - errors
