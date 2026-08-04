@@ -55,10 +55,12 @@ logger = logging.getLogger(__name__)
 #  3. Any remaining Jinja2 block tag or expression
 _JINJA_RE = re.compile(
     r'"(\{\{[^}]*?\}\})"'            # group 1: already-quoted {{expr}}
-    # A string literal that only *contains* an expression, e.g. "now-{{p}}d/d": the whole literal
-    # (quotes included) becomes one token, because substituting the expression alone would put the
-    # placeholder's own quotes in the middle of the literal and break the JSON.
-    r'|"(?:[^"\\\n]|\\.)*?\{\{[^}]*?\}\}(?:[^"\\\n]|\\.)*?"'
+    # group 2: a string literal that only *contains* an expression, e.g. "now-{{p}}d/d". The whole
+    # literal becomes one token, because substituting the expression alone would put the
+    # placeholder's own quotes in the middle of the literal and break the JSON. Only the text
+    # between the quotes is captured, so restore can put it back either as a whole value or
+    # embedded in a longer string — a translated range query does the latter.
+    r'|"((?:[^"\\\n]|\\.)*?\{\{[^}]*?\}\}(?:[^"\\\n]|\\.)*?)"'
     r'|\{%-?\s*if\b.*?\{%-?\s*endif\s*-?%\}'  # full if/else/endif block
     # A for/endfor block is taken whole for the same reason as if/endif: the loop *generates* the
     # array elements, so its opening tag alone is not a value and a placeholder in its place leaves
@@ -92,6 +94,10 @@ def _jinja_substitute(text: str):
         if m.group(1) is not None:
             # Already-quoted: store inner expression only; restore will re-add quotes
             tokens.append((m.group(1), True))
+        elif m.group(2) is not None:
+            # A literal containing an expression: store its *contents*, so restore works whether the
+            # placeholder is still a whole value or has been embedded in a longer string.
+            tokens.append((m.group(2), True))
         else:
             tokens.append((m.group(0), False))
         return f'"__J_{idx}__"'
@@ -200,6 +206,11 @@ def _jinja_restore(json_text: str, tokens: list) -> str:
         if was_quoted:
             # Was "{{expr}}" — restore with surrounding quotes
             json_text = json_text.replace(placeholder_json, f'"{original}"')
+            # A conversion may move the placeholder *into* another string: translating a range query
+            # to Solr's syntax turns {"gte": "__J_0__"} into "@timestamp:[__J_0__ TO now/d]", where
+            # the bare marker no longer has quotes of its own to match. Put the expression back there
+            # too, or the marker ships in the converted workload.
+            json_text = json_text.replace(f'__J_{idx}__', original)
         else:
             # Was bare {{expr}} or {%…%} — replace the entire quoted placeholder.
             json_text = json_text.replace(placeholder_json, original)

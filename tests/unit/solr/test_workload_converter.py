@@ -476,6 +476,25 @@ class TestJinjaSubstituteRoundTrip(unittest.TestCase):
                              json.loads(env.from_string(restored).render(**context)),
                              msg=f"differs with context {context}")
 
+    def test_placeholder_moved_into_another_string_is_still_restored(self):
+        # Translating a range query to Solr syntax moves the placeholder into a longer string, where
+        # it no longer has quotes of its own. http_logs' "range" operation shipped with a raw
+        # __J_20__ marker in its query until restore also matched the bare form.
+        from solrorbit.conversion.query import translate_to_solr_json_dsl
+        source = ('{"query": {"range": {"@timestamp": '
+                  '{"gte": "now-{{ \'15-05-1998\' | days_ago(now) }}d/d", "lt": "now/d"}}}}')
+        modified, tokens = _jinja_substitute(source)
+        translated = translate_to_solr_json_dsl(json.loads(modified))
+        restored = _jinja_restore(json.dumps(translated), tokens)
+        self.assertNotIn("__J_", restored)
+        self.assertIn("{{ '15-05-1998' | days_ago(now) }}", restored)
+
+    def test_marker_indices_do_not_collide_by_prefix(self):
+        # __J_1__ must not match inside __J_11__, or restoring in index order would corrupt the rest.
+        tokens = [("E%d" % i, True) for i in range(13)]
+        restored = _jinja_restore('"a[__J_1__ TO __J_11__ TO __J_12__]"', tokens)
+        self.assertEqual('"a[E1 TO E11 TO E12]"', restored)
+
     def test_plain_quoted_expression_still_round_trips(self):
         # The pre-existing shape, to show the two additions did not displace it.
         source = '{"clients": "{{ bulk_indexing_clients | default(8) }}"}'
