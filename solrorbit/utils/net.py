@@ -40,9 +40,28 @@ from solrorbit.utils import console, convert
 __HTTP = None
 
 
+def ca_bundle_path():
+    """
+    Path to the CA bundle used to verify HTTPS connections.
+
+    Honours ``SSL_CERT_FILE`` and ``REQUESTS_CA_BUNDLE``, the variables the Python standard
+    library and requests already recognise, so that a host whose TLS is terminated by a proxy
+    with its own root can point at the trust store that root is installed in. Falls back to
+    the bundle shipped by certifi.
+    """
+    for env_var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        path = os.getenv(env_var)
+        if path and os.path.isfile(path):
+            return path
+    return certifi.where()
+
+
 def init():
     logger = logging.getLogger(__name__)
     global __HTTP
+    ca_certs = ca_bundle_path()
+    if ca_certs != certifi.where():
+        logger.info("Verifying HTTPS connections with the CA bundle at [%s].", ca_certs)
     proxy_url = os.getenv("http_proxy")
     if proxy_url and len(proxy_url) > 0:
         parsed_url = urllib3.util.parse_url(proxy_url)
@@ -50,12 +69,12 @@ def init():
                     proxy_url)
         __HTTP = urllib3.ProxyManager(proxy_url,
                                       cert_reqs='CERT_REQUIRED',
-                                      ca_certs=certifi.where(),
+                                      ca_certs=ca_certs,
                                       # appropriate headers will only be set if there is auth info
                                       proxy_headers=urllib3.make_headers(proxy_basic_auth=parsed_url.auth))
     else:
         logger.info("Connecting directly to the Internet (no proxy support).")
-        __HTTP = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
+        __HTTP = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_certs)
 
 
 class Progress:

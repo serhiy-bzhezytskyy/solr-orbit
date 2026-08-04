@@ -24,9 +24,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import os
 import random
+import tempfile
 import unittest.mock as mock
 
+import certifi
 import pytest
 
 from solrorbit.utils import net
@@ -97,3 +100,35 @@ class TestNetUtils:
         mock_progress.reset_mock()
         progress(42, None)
         assert mock_progress.print.called
+
+
+class TestCaBundlePath:
+    def test_falls_back_to_certifi_when_no_env_var_is_set(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert net.ca_bundle_path() == certifi.where()
+
+    def test_ssl_cert_file_wins_over_certifi(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as bundle:
+            with mock.patch.dict(os.environ, {"SSL_CERT_FILE": bundle.name}, clear=True):
+                assert net.ca_bundle_path() == bundle.name
+
+    def test_requests_ca_bundle_is_honoured(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as bundle:
+            with mock.patch.dict(os.environ, {"REQUESTS_CA_BUNDLE": bundle.name}, clear=True):
+                assert net.ca_bundle_path() == bundle.name
+
+    def test_ssl_cert_file_takes_precedence_over_requests_ca_bundle(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as first, \
+                tempfile.NamedTemporaryFile(suffix=".pem") as second:
+            env = {"SSL_CERT_FILE": first.name, "REQUESTS_CA_BUNDLE": second.name}
+            with mock.patch.dict(os.environ, env, clear=True):
+                assert net.ca_bundle_path() == first.name
+
+    def test_ignores_a_path_that_does_not_exist(self):
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "/does/not/exist.pem"}, clear=True):
+            assert net.ca_bundle_path() == certifi.where()
+
+    def test_ignores_a_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {"SSL_CERT_FILE": directory}, clear=True):
+                assert net.ca_bundle_path() == certifi.where()
