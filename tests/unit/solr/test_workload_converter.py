@@ -872,3 +872,137 @@ class TestQueryStringAndPostFilter(unittest.TestCase):
             "aggs": {"by_region": {"terms": {"field": "cloud.region", "size": 5}}},
         })
         self.assertNotIn("domain", body["facet"]["by_region"])
+
+
+class TestTupleAggregations(unittest.TestCase):
+    """
+    multi_terms and composite group by a tuple of fields; Solr states that as nested terms facets.
+
+    Skipped, the aggregation vanished and the operation stayed a valid search reporting a hit count and
+    no buckets at all — clickbench has 14 of these across 16 operations, which is the shape of a silent
+    zero rather than a failure.
+    """
+
+    def test_multi_terms_nests_one_level_per_field(self):
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"a": {"multi_terms": {
+                "terms": [{"field": "WatchID"}, {"field": "ClientIP"}], "size": 10}}}})
+        outer = body["facet"]["a"]
+        self.assertEqual(("terms", "WatchID", 10), (outer["type"], outer["field"], outer["limit"]))
+        inner = outer["facet"]["ClientIP"]
+        self.assertEqual(("terms", "ClientIP", 10), (inner["type"], inner["field"], inner["limit"]))
+
+    def test_a_composite_reads_its_fields_from_its_sources(self):
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"c": {"composite": {"sources": [
+                {"x": {"terms": {"field": "URLHash", "order": "desc"}}},
+                {"y": {"terms": {"field": "EventDate", "order": "asc"}}}]}}}})
+        outer = body["facet"]["c"]
+        self.assertEqual("URLHash", outer["field"])
+        self.assertEqual("index desc", outer["sort"])
+        self.assertEqual("index asc", outer["facet"]["EventDate"]["sort"])
+
+    def test_a_composite_is_not_truncated_by_a_size(self):
+        # It paginates upstream rather than truncating, so a Solr facet must ask for every bucket:
+        # a default limit of 10 would have reported ten buckets of a set with hundreds.
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"c": {"composite": {"sources": [
+                {"x": {"terms": {"field": "A"}}}]}}}})
+        self.assertEqual(-1, body["facet"]["c"]["limit"])
+
+    def test_a_multi_terms_size_is_honoured(self):
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"a": {"multi_terms": {
+                "terms": [{"field": "A"}], "size": 25}}}})
+        self.assertEqual(25, body["facet"]["a"]["limit"])
+
+    def test_a_metric_sub_aggregation_lands_on_the_innermost_level(self):
+        # A metric belongs to the tuple, so it must be computed inside the last grouping level, not
+        # beside the first.
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"a": {
+                "multi_terms": {"terms": [{"field": "A"}, {"field": "B"}], "size": 5},
+                "aggregations": {"m": {"avg": {"field": "N"}}}}}})
+        self.assertNotIn("m", body["facet"]["a"].get("facet", {}))
+        self.assertEqual("avg(N)", body["facet"]["a"]["facet"]["B"]["facet"]["m"])
+
+    def test_a_tuple_aggregation_naming_no_field_is_reported_not_emitted(self):
+        body = translate_to_solr_json_dsl({"aggregations": {"a": {"multi_terms": {"terms": []}}}})
+        self.assertNotIn("facet", body)
+
+
+class TestRawSearchAndDroppedAggregations(unittest.TestCase):
+    """A raw request to the search endpoint, and an aggregation that cannot be carried."""
+
+    def test_a_raw_request_to_the_search_endpoint_becomes_a_search(self):
+        # clickbench declares all 45 of its DSL operations this way. Left as raw requests they would
+        # have sent OpenSearch query DSL to a Solr path that does not exist.
+        op = {"name": "dsl-q01", "operation-type": "raw-request", "path": "/_search",
+              "method": "POST", "body": {"query": {"match_all": {}}, "size": 0}}
+        wc._TARGET_COLLECTION = "clickbench"
+        wc._convert_operation(op, [], [], "", "")
+        self.assertEqual("search", op["operation-type"])
+        self.assertEqual("*:*", op["body"]["query"])
+        self.assertNotIn("path", op)
+        self.assertEqual("clickbench", op["collection"])
+
+    def test_a_raw_request_to_another_endpoint_is_left_alone(self):
+        op = {"name": "flush", "operation-type": "raw-request", "method": "POST",
+              "path": "/clickbench/_flush", "body": {}}
+        wc._convert_operation(op, [], [], "", "")
+        self.assertEqual("raw-request", op["operation-type"])
+        self.assertEqual("/clickbench/_flush", op["path"])
+
+    def test_an_untranslatable_aggregation_is_reported_not_silently_dropped(self):
+        # The operation stays a valid search reporting a hit count and no buckets, which reads as a
+        # working search that measures nothing. 16 clickbench operations were in this state.
+        op = {"name": "dsl-q29", "operation-type": "raw-request", "path": "/_search",
+              "method": "POST",
+              "body": {"aggregations": {"c": {"composite": {"sources": [
+                  {"k": {"terms": {"script": {"source": "..."}}}}]}}}}}
+        issues = []
+        wc._TARGET_COLLECTION = "clickbench"
+        wc._convert_operation(op, issues, [], "", "")
+        self.assertTrue(any("dsl-q29" in i and "hit count only" in i for i in issues))
+
+    def test_a_translatable_aggregation_raises_no_issue(self):
+        op = {"name": "dsl-ok", "operation-type": "raw-request", "path": "/_search",
+              "method": "POST",
+              "body": {"aggregations": {"t": {"terms": {"field": "CounterID", "size": 5}}}}}
+        issues = []
+        wc._TARGET_COLLECTION = "clickbench"
+        wc._convert_operation(op, issues, [], "", "")
+        self.assertEqual([], issues)
+        self.assertIn("facet", op["body"])
+
+    def test_a_composite_source_computed_by_a_script_is_refused_whole(self):
+        # Emitting the remaining sources would bucket by a different tuple than upstream measures.
+        body = translate_to_solr_json_dsl({"aggregations": {"c": {"composite": {"sources": [
+            {"k": {"terms": {"script": {"source": "..."}}}},
+            {"d": {"terms": {"field": "EventDate"}}}]}}}})
+        self.assertNotIn("facet", body)
+
+    def test_a_composite_source_may_bucket_by_time(self):
+        body = translate_to_solr_json_dsl({"aggregations": {"c": {"composite": {"sources": [
+            {"M": {"date_histogram": {"field": "EventTime", "fixed_interval": "1m"}}}]}}}})
+        facet = body["facet"]["c"]
+        self.assertEqual("range", facet["type"])
+        self.assertEqual("EventTime", facet["field"])
+        self.assertEqual("+1MINUTE", facet["gap"])
+
+    def test_a_wildcard_query_is_translated(self):
+        # Untranslated it fell through to *:* and matched the whole corpus.
+        body = translate_to_solr_json_dsl(
+            {"query": {"wildcard": {"URL": {"value": "*google*"}}}})
+        self.assertEqual("URL:*google*", body["query"])
+
+    def test_a_prefix_query_gets_its_trailing_metacharacter(self):
+        body = translate_to_solr_json_dsl({"query": {"prefix": {"URL": {"value": "http://x"}}}})
+        self.assertEqual("URL:http://x*", body["query"])
+
+    def test_a_cardinality_aggregation_uses_the_exact_form(self):
+        # Upstream's cardinality is a HyperLogLog estimate — measured on big5 it answered 5,958 where
+        # the true distinct count is 5,909. Solr's unique() is exact, and that is the deliberate choice.
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"u": {"cardinality": {"field": "UserID"}}}})
+        self.assertEqual("unique(UserID)", body["facet"]["u"])

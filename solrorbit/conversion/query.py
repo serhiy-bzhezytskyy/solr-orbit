@@ -159,6 +159,20 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
             field = normalize_field_name(field)
             return _translate_terms_clause(field, values)
 
+    if "wildcard" in node or "prefix" in node:
+        # Both are Lucene's own query forms, so Solr states them directly. Untranslated they fell
+        # through to *:* and the operation matched the whole corpus.
+        kind = "wildcard" if "wildcard" in node else "prefix"
+        for field, value in node[kind].items():
+            pattern = value.get("value", value.get("wildcard", value)) if isinstance(value, dict) \
+                else value
+            if pattern is None:
+                continue
+            field = normalize_field_name(field)
+            # A wildcard states its own metacharacters; a prefix implies a trailing one. Neither is
+            # escaped, since the pattern is the query.
+            return "%s:%s" % (field, pattern if kind == "wildcard" else "%s*" % pattern)
+
     if "query_string" in node or "simple_query_string" in node:
         # A query string is already Lucene syntax on the OpenSearch side, and Solr's default parser
         # reads the same syntax — what differs is the field spelling and how a default field is named.
@@ -540,6 +554,92 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
                 facet_def["facet"] = sub
         return facet_def
 
+    if "multi_terms" in agg_def or "composite" in agg_def:
+        # Both group by a tuple of fields, which Solr states as nested terms facets, one level per
+        # source. Skipped, the aggregation vanished and the operation stayed a valid search returning a
+        # hit count and no buckets — clickbench has 14 of these across 16 operations.
+        #
+        # They differ from each other only in how they bound the result: multi_terms truncates to a
+        # size, composite paginates with an after_key. A Solr facet truncates, so a composite's total
+        # bucket set is reached by asking for all of them; the JSON operations for big5 measured that
+        # both engines then report the identical set.
+        histograms = {}
+        if "multi_terms" in agg_def:
+            conf = agg_def["multi_terms"]
+            sources = [t.get("field") for t in conf.get("terms", []) if isinstance(t, dict)]
+            size = conf.get("size", 10)
+            orders = [None] * len(sources)
+        else:
+            conf = agg_def["composite"]
+            sources, orders, histograms = [], [], {}
+            for source in conf.get("sources", []):
+                if not isinstance(source, dict):
+                    continue
+                for _, spec in source.items():
+                    if not isinstance(spec, dict):
+                        continue
+                    terms = spec.get("terms")
+                    if isinstance(terms, dict):
+                        if "script" in terms:
+                            # A source computed by a script: upstream ships a serialised Calcite
+                            # expression, which has no Solr spelling. Reported rather than dropped —
+                            # emitting the remaining sources would bucket by a different tuple.
+                            logger.warning(
+                                "composite agg '%s' has a script-computed source, which has no Solr "
+                                "equivalent — the aggregation is not translated.", agg_name)
+                            return None
+                        sources.append(terms.get("field"))
+                        orders.append(terms.get("order"))
+                        continue
+                    # A composite source may bucket by time rather than by term.
+                    histogram = spec.get("date_histogram")
+                    if isinstance(histogram, dict):
+                        field = normalize_field_name(histogram.get("field", ""))
+                        if not field:
+                            logger.warning("composite agg '%s' has a date source with no field",
+                                          agg_name)
+                            return None
+                        histograms[len(sources)] = histogram
+                        sources.append(histogram.get("field"))
+                        orders.append(histogram.get("order"))
+            # A composite paginates rather than truncating, so no size caps its buckets.
+            size = conf.get("size", -1)
+
+        fields = [normalize_field_name(f) for f in sources if f]
+        if not fields:
+            logger.warning("%s agg '%s' names no field — skipping",
+                          "multi_terms" if "multi_terms" in agg_def else "composite", agg_name)
+            return None
+
+        nested = agg_def.get("aggs") or agg_def.get("aggregations")
+        inner = _convert_aggregations_to_facets(nested, date_bounds) if nested else None
+
+        # Build outermost-first, so the innermost level carries the metric sub-aggregations.
+        facet_def = None
+        for depth in reversed(range(len(fields))):
+            histogram = histograms.get(depth)
+            if histogram:
+                # A time source is a range facet over the field's own bounds, as for a date_histogram.
+                interval = (histogram.get("fixed_interval") or histogram.get("calendar_interval")
+                            or histogram.get("interval"))
+                level = {"type": "range", "field": fields[depth],
+                         "gap": _calendar_interval_to_solr_gap(interval) if interval else "+1DAY"}
+                if date_bounds and date_bounds[0] and date_bounds[1]:
+                    level["start"] = date_bounds[0]
+                    level["end"] = date_bounds[1]
+            else:
+                level = {"type": "terms", "field": fields[depth], "limit": size}
+            order = orders[depth] if depth < len(orders) else None
+            if order in ("asc", "desc") and level["type"] == "terms":
+                # A composite source states its own direction, over the term rather than the count.
+                level["sort"] = "index %s" % order
+            if facet_def is not None:
+                level["facet"] = {fields[depth + 1]: facet_def}
+            elif inner:
+                level["facet"] = inner
+            facet_def = level
+        return facet_def
+
     if "date_histogram" in agg_def or "auto_date_histogram" in agg_def:
         auto = "auto_date_histogram" in agg_def
         dh_conf = agg_def["auto_date_histogram"] if auto else agg_def["date_histogram"]
@@ -647,6 +747,21 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
             logger.warning("value_count agg '%s' has no field — skipping", agg_name)
             return None
         return f"countvals({field})"
+
+    if "cardinality" in agg_def:
+        # Skipped, the aggregation vanished and the operation stayed a valid search reporting a hit
+        # count and nothing else — 8 of clickbench's are this.
+        #
+        # Solr has both an exact and an estimating form. `unique()` is exact, and upstream's
+        # `cardinality` is a HyperLogLog *estimate*: measured on big5, upstream answered 5,958 where the
+        # true distinct count is 5,909. So the two do not agree by construction, and the exact one is
+        # chosen deliberately — a benchmark comparing engines should report what the field contains, and
+        # the estimate is the side that has to justify itself.
+        field = normalize_field_name(agg_def["cardinality"].get("field", ""))
+        if not field:
+            logger.warning("cardinality agg '%s' has no field — skipping", agg_name)
+            return None
+        return f"unique({field})"
 
     agg_type = next(iter(agg_def), "unknown")
     logger.warning(

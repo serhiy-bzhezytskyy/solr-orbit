@@ -1031,10 +1031,18 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
             or "aggs" in body or "aggregations" in body
             or "size" in body or "sort" in body)
         if translatable:
+            declared_aggs = body.get("aggs") or body.get("aggregations")
             try:
                 op["body"] = translate_to_solr_json_dsl(body)
             except Exception as exc:
                 issues.append(f"Could not translate search body for op '{op.get('name', '?')}': {exc}")
+            else:
+                # An aggregation that could not be translated left the operation a valid search with no
+                # facet, reporting a hit count and nothing else — the shape of a silent zero. Say so.
+                if declared_aggs and "facet" not in op["body"]:
+                    issues.append(
+                        "Operation '%s' declares an aggregation with no Solr equivalent; the converted "
+                        "operation reports a hit count only." % op.get("name", "?"))
 
         # Load body from file if referenced
         body_file = op.get("body-params", {}).get("body") if isinstance(op.get("body-params"), dict) else None
@@ -1060,7 +1068,51 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
     if op.get("operation-type") == "raw-request" and _is_ppl_request(op):
         _convert_ppl_operation(op, issues, skipped)
 
+    # A raw request to the search endpoint is a search, whatever its declared type. clickbench states
+    # all 45 of its DSL operations this way, and left as raw requests they would have sent OpenSearch
+    # query DSL to a Solr path that does not exist.
+    if op.get("operation-type") == "raw-request" and _is_search_request(op):
+        _convert_raw_search_operation(op, issues)
+
     return True
+
+
+# The endpoints a raw request may name when what it really is, is a search.
+_SEARCH_PATHS = ("/_search", "/_msearch", "/_count")
+
+
+def _is_search_request(op):
+    """Say whether a raw request targets the search endpoint with a query body."""
+    path = (op.get("path") or "").split("?")[0].rstrip("/")
+    if not any(path == p or path.endswith(p) for p in _SEARCH_PATHS):
+        return False
+    return isinstance(op.get("body"), dict)
+
+
+def _convert_raw_search_operation(op, issues):
+    """Rewrite a raw search request into a Solr search operation, in place.
+
+    The body is translated the same way a declared search's body is; the operation becomes a `search`,
+    so the runner posts it to the collection's query endpoint rather than to a path Solr has never
+    heard of.
+    """
+    op_name = op.get("name", "?")
+    declared_aggs = op["body"].get("aggs") or op["body"].get("aggregations")
+    try:
+        translated = translate_to_solr_json_dsl(op["body"])
+    except Exception as exc:  # pylint: disable=broad-except
+        issues.append("Could not translate raw search body for op '%s': %s" % (op_name, exc))
+        return
+    if declared_aggs and "facet" not in translated:
+        issues.append(
+            "Operation '%s' declares an aggregation with no Solr equivalent; the converted operation "
+            "reports a hit count only." % op_name)
+    op["operation-type"] = "search"
+    op["body"] = translated
+    op.pop("path", None)
+    op.pop("method", None)
+    if not op.get("collection") and _TARGET_COLLECTION:
+        op["collection"] = _TARGET_COLLECTION
 
 
 def _is_ppl_request(op):
