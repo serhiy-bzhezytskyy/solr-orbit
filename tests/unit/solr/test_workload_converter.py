@@ -273,6 +273,60 @@ class TestConvertOpensearchWorkload(unittest.TestCase):
             self.assertIn('"body": "keep-me"', out)
             self.assertIn('"configset-path": "configsets/logs-1"', out)
 
+    def test_a_separator_the_converter_inserted_does_not_count_as_the_source_comma(self):
+        """
+        force_merge.json writes `"request-timeout": {{ … }}{%- if … %}, "key": value {%- endif %}`.
+
+        The expression before the block becomes a placeholder with no comma after it, so the separator
+        pass inserts one — and that comma is the converter's own. Reading it as the source's dropped
+        the real separator and left two values side by side, which broke every workload that
+        force-merges.
+
+        ⚠️ Driven through the whole conversion, not the fragment helpers: a shared fragment reaches the
+        output by a different path, and the isolated round trip stays valid either way. That is why
+        the first version of this test passed with the fix reverted.
+        """
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            self._make_source_workload(src, {
+                "indices": [{"name": "c"}],
+                "challenges": [{"name": "default", "schedule": [
+                    {"operation": "x"},
+                ]}],
+            })
+            os.makedirs(os.path.join(src, "test_procedures"))
+            with open(os.path.join(src, "test_procedures", "default.json"), "w") as f:
+                # The path is relative to the fragment's own directory, so from test_procedures/ a
+                # shared fragment beside the workload is two levels up.
+                f.write('{\n  "name": "default",\n  "schedule": [\n'
+                        '    {{ benchmark.collect(parts="../../common_operations/force_merge.json") }}\n'
+                        '  ]\n}')
+            os.makedirs(os.path.join(os.path.dirname(src), "common_operations"), exist_ok=True)
+            shared = os.path.join(os.path.dirname(src), "common_operations", "force_merge.json")
+            with open(shared, "w") as f:
+                f.write('{\n    "operation": {\n'
+                        '        "operation-type": "force-merge",\n'
+                        '        "request-timeout": {{ request_timeout | default(60) | tojson }}'
+                        '{%- if max_num_segments is defined %},\n'
+                        '        "max-num-segments": {{ max_num_segments | tojson }}\n'
+                        '        {%- endif %}\n    }\n}')
+            try:
+                convert_opensearch_workload(src, dst)
+                out_path = os.path.join(dst, "common_operations", "force_merge.json")
+                self.assertTrue(os.path.isfile(out_path), "the shared fragment was not carried over")
+                written = open(out_path).read()
+                # The separator before the conditional has to survive: without it the rendered
+                # fragment holds two values with nothing between them.
+                jinja2 = __import__("jinja2")
+                env = jinja2.Environment()
+                for context in ({}, {"max_num_segments": 1}):
+                    try:
+                        json.loads("[" + env.from_string(written).render(**context) + "]")
+                    except json.JSONDecodeError as error:
+                        self.fail("the converted fragment does not render with %s: %s"
+                                  % (context, error))
+            finally:
+                os.remove(shared)
+
     def test_writes_converted_marker(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
             self._make_source_workload(src, {"indices": [], "challenges": []})
@@ -604,6 +658,68 @@ class TestJinjaSubstituteRoundTrip(unittest.TestCase):
         tokens = [("E%d" % i, True) for i in range(13)]
         restored = _jinja_restore('"a[__J_1__ TO __J_11__ TO __J_12__]"', tokens)
         self.assertEqual('"a[E1 TO E11 TO E12]"', restored)
+
+    def test_a_conditional_after_a_completed_pair(self):
+        # big5 writes `"field": "agent.name" {% if … %}, "execution_hint": … {% endif %}` — the block
+        # sits after a finished pair and carries its own leading comma, so what the placeholder needs
+        # is the separator BEFORE it, not a key to belong to.
+        source = ('{"cardinality": {\n'
+                  '  "field": "agent.name"\n'
+                  '  {% if v %}\n'
+                  '    , "execution_hint": "ordinals"\n'
+                  '  {% endif %}\n'
+                  '}}')
+        _, restored = self._round_trip(source)
+        self.assertIn("{% if v %}", restored)
+        self.assertIn('"execution_hint": "ordinals"', restored)
+        self.assertNotIn("__J_", restored)
+        self.assertNotIn("null", restored)
+
+    def test_a_conditional_standing_in_for_the_pair_after_a_comma(self):
+        # The mirror shape, also big5: `"field": "@timestamp",\n {% if … %} "calendar_interval" …`.
+        # Here the comma IS in the source and introduces the pair the block generates, so dropping it
+        # would leave two values side by side. The two cases need opposite repairs.
+        source = ('{"date_histogram": {\n'
+                  '  "field": "@timestamp",\n'
+                  '  {% if v %}\n'
+                  '    "calendar_interval": "hour"\n'
+                  '  {% else %}\n'
+                  '    "interval": "hour"\n'
+                  '  {% endif %}\n'
+                  '}}')
+        _, restored = self._round_trip(source)
+        self.assertIn('"field": "@timestamp",', restored)
+        self.assertIn("{% else %}", restored)
+        self.assertNotIn("__J_", restored)
+
+    def test_both_conditional_shapes_render_as_the_source_does(self):
+        # Parsing is not the point; what runs is the rendered template, and both branches of each
+        # conditional have to come out unchanged.
+        jinja2 = __import__("jinja2")
+        sources = [
+            ('{"a": {"field": "x"\n{% if v %}, "hint": "y"\n{% endif %}}}'),
+            ('{"a": {"field": "x",\n{% if v %}"i": "hour"\n{% else %}"j": "hour"\n{% endif %}}}'),
+        ]
+        env = jinja2.Environment()
+        for source in sources:
+            _, restored = self._round_trip(source)
+            for context in ({"v": True}, {"v": False}):
+                self.assertEqual(json.loads(env.from_string(source).render(**context)),
+                                 json.loads(env.from_string(restored).render(**context)),
+                                 msg="%r with %s" % (source, context))
+
+    def test_a_conditional_between_array_elements(self):
+        # A fragment file is a bare sequence wrapped in [ … ] before parsing, and big5's schedule
+        # closes with `} {% endif %}` after its last task — a tag at the top level, between elements.
+        source = ('{"operation": "a"}\n'
+                  '{% if v %}\n'
+                  ', {"operation": "b"}\n'
+                  '{% endif %}')
+        modified, tokens = _jinja_substitute(source)
+        parsed = json.loads("[" + modified + "]")
+        restored = _jinja_restore(json.dumps(parsed), tokens)
+        self.assertIn("{% if v %}", restored)
+        self.assertNotIn("__J_", restored)
 
     def test_plain_quoted_expression_still_round_trips(self):
         # The pre-existing shape, to show the two additions did not displace it.

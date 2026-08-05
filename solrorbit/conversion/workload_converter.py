@@ -152,10 +152,40 @@ def _mark_placeholders_in_key_position(text: str) -> str:
                 j += 1
             literal = text[i:j + 1]
             in_object = bool(stack) and stack[-1] == "{"
+            in_array = bool(stack) and stack[-1] == "["
             expects_key = in_object and prev_significant in ("{", ",")
+            # A value has just been completed if the last thing seen closed one.
+            after_value = prev_significant in ('"', "}", "]") or prev_significant.isalnum()
             match = re.fullmatch(r'"(__J_\d+__(?:_SEP)?)"', literal)
             if expects_key and match:
-                out.append('"%s_KV": null' % match.group(1))
+                # Two shapes reach here and they need different repairs. A tag whose source had NO
+                # comma before it must carry its own separator, so restore drops the one the
+                # serialiser adds — force_merge.json writes `{%- if … %},\n "key": value`. A tag that
+                # DID follow a comma is standing in for the pair that comma introduces, and dropping
+                # it would leave two values side by side; big5 writes
+                # `"field": "@timestamp",\n {% if … %} "calendar_interval": … {% endif %}`.
+                # The distinction is recorded in the marker, since the source is not visible later.
+                # ⚠️ Only a comma the *source* wrote counts. The separator pass above inserts one after
+                # a placeholder that had none, and that comma is the converter's own — treating it as
+                # the source's dropped the real separator in force_merge.json and left two values side
+                # by side. A _SEP marker just before is exactly that case.
+                inserted = re.search(r'"__J_\d+___SEP"\s*,\s*$', "".join(out))
+                suffix = "_KVC" if prev_significant == "," and not inserted else "_KV"
+                out.append('"%s%s": null' % (match.group(1), suffix))
+            elif match and after_value and (in_object or in_array or not stack):
+                # The block sits *after* a completed value and carries its own leading comma, which
+                # big5 writes both inside an object —
+                # `"field": "agent.name" {% if … %}, "execution_hint": … {% endif %}` — and between
+                # array elements, where a schedule appends more tasks the same way. So what the
+                # placeholder needs is the separator before it, not a key to belong to. In an array it
+                # stands alone; in an object it needs a key, since a bare string is not a member.
+                # A fragment file is a bare sequence of entries, wrapped in [ … ] before parsing, so a
+                # tag at the top level is between array elements once wrapped — big5's schedule closes
+                # with `} {% endif %}` after its last task.
+                if in_object:
+                    out.append(', "%s_AFTER": null' % match.group(1))
+                else:
+                    out.append(', "%s_AFTER"' % match.group(1))
             else:
                 out.append(literal)
             prev_significant = '"'
@@ -191,6 +221,24 @@ def _jinja_restore(json_text: str, tokens: list) -> str:
         # So the comma the serialiser put *before* the placeholder is dropped, and the one *after* is
         # kept: the converter can append a key of its own after the block (a `collection`, say), and
         # that key still needs a separator in the branch where the block renders empty.
+        # A block placed after a completed pair was given both a separator and a value; both come off,
+        # and the comma goes with them because the block carries its own.
+        for suffix in ("___SEP_AFTER", "___AFTER"):
+            base = f'"__J_{idx}__"'
+            quoted = re.escape(f'"__J_{idx}{suffix}"')
+            # In an object it was given a null value; in an array it stands alone. Either way the
+            # comma inserted before it goes too, since the block carries its own.
+            json_text = re.sub(r',\s*' + quoted + r'\s*:\s*null', base, json_text)
+            json_text = re.sub(quoted + r'\s*:\s*null', base, json_text)
+            json_text = re.sub(r',\s*' + quoted, base, json_text)
+            json_text = re.sub(quoted, base, json_text)
+        # _KVC: the source already had the comma, so it stays and only the placeholder's value goes.
+        for suffix in ("___SEP_KVC", "___KVC"):
+            base = f'"__J_{idx}__"'
+            marked = re.escape(f'"__J_{idx}{suffix}"') + r'\s*:\s*null'
+            json_text = re.sub(marked + r'(\s*),', base + r'\1', json_text)
+            json_text = re.sub(marked, base, json_text)
+        # _KV: the source had no comma, so the block carries its own and the added one is dropped.
         for suffix in ("___SEP_KV", "___KV"):
             base = f'"__J_{idx}__"'
             marked = re.escape(f'"__J_{idx}{suffix}"') + r'\s*:\s*null'
