@@ -86,8 +86,12 @@ OPENSEARCH_TO_SOLR_TYPES = {
     "date": "pdate",
     "binary": "binary",
 
-    # Spatial
-    "geo_point": "string",    # Stored as "lat,lon" string (converted during indexing)
+    # Spatial. The generated schema declares a location_rpt fieldType, and this is what makes a
+    # geo_point field use it. As a string the value is indexed and returned unchanged but nothing
+    # spatial works on it: a bounding-box filter, a distance filter and a heatmap grid facet all need
+    # a spatial field, and a heatmap needs an RPT one specifically. geonames and noaa each had this
+    # corrected by hand before the type table did it.
+    "geo_point": "location_rpt",
 }
 
 
@@ -162,8 +166,17 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
             "stored": True,
         }
 
-        # Add docValues for keyword fields (efficient for sorting/faceting)
-        if os_type == "keyword":
+        # Follow upstream's own default rather than guessing. OpenSearch gives doc_values to keyword,
+        # numeric, date and boolean fields unless the mapping switches them off, and withholds them
+        # from binary and text — Parameter.docValuesParam(…, true) in NumberFieldMapper,
+        # DateFieldMapper and BooleanFieldMapper, and (…, false) in BinaryFieldMapper. They are what a
+        # sort, an aggregation and a range filter read, so declaring only keyword left noaa's
+        # station_elevation without them, on a field its operations filter by.
+        _NO_DOC_VALUES = {"binary", "text"}
+        if field_config.get("doc_values") is False or os_type in _NO_DOC_VALUES:
+            pass
+        elif solr_type not in ("text_general", "location_rpt"):
+            # A text field has no per-document values, and an RPT field cannot expose them.
             solr_field["docValues"] = True
 
         # Handle date format

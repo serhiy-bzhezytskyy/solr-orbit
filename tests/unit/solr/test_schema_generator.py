@@ -25,6 +25,49 @@ from solrorbit.conversion.schema import (
 )
 
 
+class TestFieldTypeAndDocValues(unittest.TestCase):
+    """
+    Two things the type table got wrong, both corrected by hand in a workload before this.
+
+    A geo_point became a string, on which nothing spatial works. And doc_values were given only to
+    keyword fields, where upstream gives them to numeric, date and boolean too — noaa's
+    station_elevation went without them on a field its operations filter by.
+    """
+
+    def test_a_geo_point_uses_the_spatial_field_type(self):
+        fields, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
+        self.assertEqual("location_rpt", fields["location"]["type"])
+
+    def test_a_spatial_field_gets_no_doc_values(self):
+        # An RPT field cannot expose them, which is why geonames and noaa carry lat/lon separately.
+        fields, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
+        self.assertNotIn("docValues", fields["location"])
+
+    def test_numeric_date_and_boolean_get_doc_values(self):
+        # OpenSearch defaults doc_values to true for all three — NumberFieldMapper, DateFieldMapper
+        # and BooleanFieldMapper all declare docValuesParam(…, true).
+        fields, _ = translate_opensearch_mapping({
+            "n": {"type": "integer"}, "f": {"type": "float"},
+            "d": {"type": "date"}, "b": {"type": "boolean"}, "k": {"type": "keyword"},
+        })
+        for name in ("n", "f", "d", "b", "k"):
+            self.assertTrue(fields[name].get("docValues"), msg="%s should have docValues" % name)
+
+    def test_a_mapping_that_switches_doc_values_off_is_honoured(self):
+        fields, _ = translate_opensearch_mapping({"m": {"type": "keyword", "doc_values": False}})
+        self.assertNotIn("docValues", fields["m"])
+
+    def test_a_text_field_gets_no_doc_values(self):
+        # A text field has none, and asking for them is an error.
+        fields, _ = translate_opensearch_mapping({"body": {"type": "text"}})
+        self.assertNotIn("docValues", fields["body"])
+
+    def test_binary_gets_no_doc_values(self):
+        # BinaryFieldMapper is the one that declares docValuesParam(…, false).
+        fields, _ = translate_opensearch_mapping({"blob": {"type": "binary"}})
+        self.assertNotIn("docValues", fields["blob"])
+
+
 class TestNestedObjectMappings(unittest.TestCase):
     """
     A mapping entry holding nested properties is an object, not a field.
