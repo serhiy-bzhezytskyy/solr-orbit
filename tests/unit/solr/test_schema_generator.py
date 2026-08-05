@@ -53,19 +53,47 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
         for name in ("n", "f", "d", "b", "k"):
             self.assertTrue(fields[name].get("docValues"), msg="%s should have docValues" % name)
 
-    def test_a_mapping_that_switches_doc_values_off_is_honoured(self):
+    def test_a_mapping_that_switches_doc_values_off_says_so_explicitly(self):
+        # ⚠️ Not merely absent: the generated string fieldType declares docValues="true", so a field
+        # that omits the attribute inherits it. Silence would give doc values to the one field
+        # upstream switches them off for.
         fields, _ = translate_opensearch_mapping({"m": {"type": "keyword", "doc_values": False}})
-        self.assertNotIn("docValues", fields["m"])
+        self.assertIs(False, fields["m"]["docValues"])
+
+    def test_match_only_text_is_analysed_text(self):
+        # MatchOnlyTextFieldMapper extends TextFieldMapper — positions and norms off to save storage,
+        # still analysed. Absent from the type table it fell through to string, and big5's message
+        # field then held each log line as one term: message:monkey matched nothing where upstream
+        # found 103,349 documents.
+        fields, _ = translate_opensearch_mapping({"message": {"type": "match_only_text"}})
+        self.assertEqual("text_general", fields["message"]["type"])
+
+    def test_the_types_the_ported_workloads_use_are_all_known(self):
+        # A type absent from the table falls through to string silently, which is how match_only_text
+        # and geo_point both went wrong. These are the ones the six ported workloads actually declare.
+        for os_type, expected in (("match_only_text", "text_general"), ("wildcard", "string"),
+                                  ("ip", "string"), ("double_range", "pdouble"),
+                                  ("geo_point", "location_rpt"), ("scaled_float", "pdouble"),
+                                  ("half_float", "pfloat")):
+            fields, _ = translate_opensearch_mapping({"f": {"type": os_type}})
+            self.assertEqual(expected, fields["f"]["type"], msg="%s mapped wrongly" % os_type)
+
+    def test_an_unindexed_field_is_declared_unindexed(self):
+        # http_logs maps message as a keyword with index false: it is the raw log line the grok
+        # pipeline reads, stored and returned but never searched.
+        fields, _ = translate_opensearch_mapping({"message": {"type": "keyword", "index": False}})
+        self.assertFalse(fields["message"]["indexed"])
+        self.assertTrue(fields["message"]["stored"])
 
     def test_a_text_field_gets_no_doc_values(self):
         # A text field has none, and asking for them is an error.
         fields, _ = translate_opensearch_mapping({"body": {"type": "text"}})
         self.assertNotIn("docValues", fields["body"])
 
-    def test_binary_gets_no_doc_values(self):
+    def test_binary_gets_doc_values_switched_off(self):
         # BinaryFieldMapper is the one that declares docValuesParam(…, false).
         fields, _ = translate_opensearch_mapping({"blob": {"type": "binary"}})
-        self.assertNotIn("docValues", fields["blob"])
+        self.assertIs(False, fields["blob"]["docValues"])
 
 
 class TestNestedObjectMappings(unittest.TestCase):

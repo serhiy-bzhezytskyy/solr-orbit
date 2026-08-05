@@ -80,6 +80,25 @@ OPENSEARCH_TO_SOLR_TYPES = {
     # String types
     "keyword": "string",            # Exact match, no analysis
     "text": "text_general",         # Analyzed text
+    # match_only_text is TextFieldMapper with positions and norms switched off to save storage —
+    # MatchOnlyTextFieldMapper extends TextFieldMapper — so it is analysed text like any other. Absent
+    # from this table it fell through to string, and big5's message field then held each log line as a
+    # single term: message:monkey matched nothing where upstream found 103,349 documents.
+    "match_only_text": "text_general",
+    "wildcard": "string",           # Exact-match keyword variant, indexed for wildcard queries
+    # An ip field: string is right for what the workloads do with it. http_logs only matches, counts
+    # cardinality and facets on clientip — measured, no operation asks for a CIDR range — and a string
+    # reproduces all three exactly.
+    "ip": "string",
+    # A range field holds two bounds, which Solr has no single type for. The pair is flattened at
+    # index time to <field>_gte and <field>_lte, and a query on it becomes a test on both, because a
+    # range-field query means INTERSECTS by default. Naming the type here keeps it out of the
+    # unknown-type warning; the two bound fields are what the schema actually needs.
+    "integer_range": "pint",
+    "long_range": "plong",
+    "float_range": "pfloat",
+    "double_range": "pdouble",
+    "date_range": "pdate",
 
     # Other types
     "boolean": "boolean",
@@ -160,9 +179,12 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
             solr_type = "string"
 
         # Build Solr field config
+        # A mapping may switch indexing off. http_logs does for message: it is the raw log line the
+        # grok pipeline reads, stored and returned but never searched, so indexing it would cost for
+        # nothing and misrepresent what upstream measures.
         solr_field = {
             "type": solr_type,
-            "indexed": True,
+            "indexed": field_config.get("index", True) is not False,
             "stored": True,
         }
 
@@ -174,7 +196,11 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
         # station_elevation without them, on a field its operations filter by.
         _NO_DOC_VALUES = {"binary", "text"}
         if field_config.get("doc_values") is False or os_type in _NO_DOC_VALUES:
-            pass
+            # ⚠️ Say false rather than omitting it. The generated string fieldType declares
+            # docValues="true", and a field that leaves the attribute out inherits that — so silence
+            # would give doc values to the one field upstream switches them off for.
+            if solr_type not in ("text_general", "location_rpt"):
+                solr_field["docValues"] = False
         elif solr_type not in ("text_general", "location_rpt"):
             # A text field has no per-document values, and an RPT field cannot expose them.
             solr_field["docValues"] = True
