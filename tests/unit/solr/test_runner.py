@@ -29,6 +29,7 @@ from solrorbit.worker_coordinator.runner import (
     SolrBulkIndex,
     SolrSearch,
     SolrBinaryBulkIndex,
+    RawRequest,
     SolrCreateAlias,
     SolrCreateCollection,
     SolrDeleteAlias,
@@ -445,6 +446,77 @@ class TestBulkIndexUpdateChain(unittest.TestCase):
         _run(SolrBinaryBulkIndex()(client, self._params(pipeline="grok-pipeline")))
         self.assertIn("update.chain=grok-pipeline", client.requests[0][1])
         self.assertEqual("application/javabin", client.requests[0][2].get("Content-type"))
+
+
+class _RecordingRawClient:
+    """Records the raw request and answers with a payload the test chooses."""
+
+    def __init__(self, payload=None, status_code=200):
+        self.calls = []
+        self.payload = payload if payload is not None else {}
+        self.status_code = status_code
+
+    def raw_request(self, method, path, body=None, headers=None):
+        self.calls.append((method, path, body, headers or {}))
+        resp = MagicMock()
+        resp.status_code = self.status_code
+        resp.json.return_value = self.payload
+        resp.text = ""
+        return resp
+
+
+class TestRawRequestFormAndInPayloadErrors(unittest.TestCase):
+    """
+    Some Solr handlers read their input from request parameters rather than a JSON body, and some
+    report failure inside a 200. big5's 46 PPL operations become SQL, and Solr's /sql handler does
+    both: it answers "stmt parameter cannot be null" to a JSON body, and puts an EXCEPTION entry in
+    its result-set when a statement fails.
+    """
+
+    def _params(self, **extra):
+        return {"method": "POST", "path": "/solr/c/sql", "body": {"stmt": "SELECT id FROM c"}, **extra}
+
+    def test_form_sends_an_encoded_body_with_the_matching_content_type(self):
+        client = _RecordingRawClient()
+        _run(RawRequest()(client, self._params(form=True)))
+        method, path, body, headers = client.calls[0]
+        self.assertEqual("stmt=SELECT+id+FROM+c", body)
+        self.assertEqual("application/x-www-form-urlencoded", headers.get("Content-type"))
+
+    def test_without_form_the_body_is_left_as_a_dict_for_json(self):
+        client = _RecordingRawClient()
+        _run(RawRequest()(client, self._params()))
+        self.assertEqual({"stmt": "SELECT id FROM c"}, client.calls[0][2])
+
+    def test_an_exception_inside_a_200_is_reported_as_a_failure(self):
+        # A status check alone would call this a success on a query that did not run.
+        client = _RecordingRawClient(payload={"result-set": {"docs": [
+            {"EXCEPTION": "stmt parameter cannot be null", "EOF": True}]}})
+        result = _run(RawRequest()(client, self._params(form=True)))
+        self.assertEqual(200, result["http-status"])
+        self.assertFalse(result["success"])
+        self.assertEqual(1, result["error-count"])
+
+    def test_a_clean_result_set_is_a_success(self):
+        client = _RecordingRawClient(payload={"result-set": {"docs": [
+            {"id": "1"}, {"EOF": True, "RESPONSE_TIME": 4}]}})
+        result = _run(RawRequest()(client, self._params(form=True)))
+        self.assertTrue(result["success"])
+        self.assertEqual(0, result["error-count"])
+
+    def test_a_4xx_is_a_failure_even_with_no_payload(self):
+        client = _RecordingRawClient(status_code=400)
+        result = _run(RawRequest()(client, self._params()))
+        self.assertFalse(result["success"])
+        self.assertEqual(1, result["error-count"])
+
+    def test_a_response_that_is_not_json_does_not_raise(self):
+        client = _RecordingRawClient()
+        client.raw_request = lambda *a, **k: type("R", (), {
+            "status_code": 200, "text": "not json",
+            "json": lambda self: (_ for _ in ()).throw(ValueError("no json"))})()
+        result = _run(RawRequest()(client, self._params()))
+        self.assertTrue(result["success"])
 
 
 class TestSolrSearch(unittest.TestCase):

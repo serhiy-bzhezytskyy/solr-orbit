@@ -2089,6 +2089,11 @@ class RawRequest(Runner):
 
     Params:
       - ``method`` (default "GET"), ``path``, ``body``, ``headers``
+      - ``form`` — send the body form-encoded rather than as JSON
+
+    ⚠️ Some Solr handlers read their input from request parameters, not from a JSON body: ``/sql``
+    answers "stmt parameter cannot be null" to a JSON body carrying ``stmt`` and works when the same
+    body is form-encoded. Setting ``form`` says which, since the runner cannot tell from the path.
     """
 
     async def __call__(self, client, params):
@@ -2096,16 +2101,41 @@ class RawRequest(Runner):
         method = params.get("method", "GET")
         path = params["path"]
         body = params.get("body")
-        headers = params.get("headers", {})
+        headers = dict(params.get("headers", {}))
+
+        if params.get("form") and isinstance(body, dict):
+            body = urllib.parse.urlencode(body)
+            headers.setdefault("Content-type", "application/x-www-form-urlencoded")
 
         start = time.perf_counter()
         resp = await _run_in_executor(sc.raw_request, method, path, body, headers)
         elapsed = time.perf_counter() - start
 
+        # A handler can answer 200 and report the failure inside the payload. Solr's SQL handler puts
+        # an EXCEPTION entry in its result-set, so a status check alone reports success on a query
+        # that did not run.
+        error = None
+        if resp.status_code < 400:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                docs = (payload.get("result-set") or {}).get("docs") or []
+                for doc in docs:
+                    if isinstance(doc, dict) and "EXCEPTION" in doc:
+                        error = str(doc["EXCEPTION"])[:200]
+                        break
+
+        if error:
+            logging.getLogger(__name__).error("Request to %s reported: %s", path, error)
+
         return {
             "weight": 1,
             "unit": "ops",
             "http-status": resp.status_code,
+            "success": resp.status_code < 400 and error is None,
+            "error-count": 0 if error is None and resp.status_code < 400 else 1,
             "took": elapsed,
         }
 
