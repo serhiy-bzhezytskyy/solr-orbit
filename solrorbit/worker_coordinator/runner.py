@@ -1198,7 +1198,7 @@ def _translate_ndjson_batch(lines):
     return docs
 
 
-def _translate_ndjson_stream(lines):
+def _translate_ndjson_stream(lines, integer_fields=None):
     """
     Stream-translate NDJSON to Solr documents (generator version).
 
@@ -1233,13 +1233,14 @@ def _translate_ndjson_stream(lines):
     )
 
     if has_action_keys:
-        yield from _stream_bulk_pairs(first_line, it)
+        yield from _stream_bulk_pairs(first_line, it, integer_fields)
     else:
-        # Plain NDJSON carries no action line, so there is no per-document target.
+        # Plain NDJSON carries no action line, so there is no per-document target. The same document
+        # preparation applies: this branch used to flatten nothing, repair no timestamp and coerce
+        # nothing, so a corpus published without bulk action lines was prepared differently from the
+        # same documents published with them.
         if isinstance(first_obj, dict):
-            if "id" not in first_obj:
-                first_obj["id"] = str(hash(json.dumps(first_obj, sort_keys=True)))
-            yield first_obj, None
+            yield _prepare_document(first_obj, integer_fields), None
         for line in it:
             line = line.strip()
             if not line:
@@ -1247,18 +1248,35 @@ def _translate_ndjson_stream(lines):
             try:
                 obj = json.loads(line)
                 if isinstance(obj, dict):
-                    if "id" not in obj:
-                        obj["id"] = str(hash(json.dumps(obj, sort_keys=True)))
-                    for key, value in list(obj.items()):
-                        if isinstance(value, list) and len(value) == 2:
-                            if all(isinstance(v, (int, float)) for v in value):
-                                obj[key] = f"{value[1]},{value[0]}"
-                    yield obj, None
+                    yield _prepare_document(obj, integer_fields), None
             except json.JSONDecodeError as exc:
                 _logger.warning("Skipping malformed NDJSON line: %s", exc)
 
 
-def _stream_bulk_pairs(first_action_line, lines_iter):
+def _prepare_document(doc, integer_fields=None):
+    """Make one parsed corpus document ready for Solr.
+
+    Flatten it, give it an id if it has none, coerce a fraction in a field declared integral, turn a
+    two-element numeric list into the ``"lat,lon"`` a spatial field takes, and give a zoneless timestamp
+    the zone Solr requires. Shared by both corpus shapes so the two cannot drift apart — they had.
+    """
+    if "id" not in doc:
+        doc["id"] = str(abs(hash(json.dumps(doc, sort_keys=True))))
+    doc = _flatten_document(doc)
+    doc = _coerce_integer_fields(doc, integer_fields)
+    for key, value in list(doc.items()):
+        if isinstance(value, list) and len(value) == 2:
+            if all(isinstance(v, (int, float)) for v in value):
+                doc[key] = f"{value[1]},{value[0]}"
+        elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
+            # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the zone
+            # and rejects the value outright, so every document would fail.
+            if value[4] == '-' and value[7] == '-' and value[13] == ':' and value[16] == ':':
+                doc[key] = value.replace(' ', 'T') + 'Z'
+    return doc
+
+
+def _stream_bulk_pairs(first_action_line, lines_iter, integer_fields=None):
     """Stream-parse OpenSearch bulk format (generator version)."""
     _logger = logging.getLogger(__name__)
     action_line = first_action_line
@@ -1305,6 +1323,7 @@ def _stream_bulk_pairs(first_action_line, lines_iter):
             doc["id"] = str(abs(hash(json.dumps(doc, sort_keys=True))))
 
         doc = _flatten_document(doc)
+        doc = _coerce_integer_fields(doc, integer_fields)
 
         for key, value in list(doc.items()):
             if isinstance(value, list) and len(value) == 2:
@@ -1357,6 +1376,79 @@ def _flatten_document(doc, prefix="", separator="_"):
         else:
             out[name] = value
     return out
+
+
+# A value a corpus writes with a fraction where the mapping declares an integer. OpenSearch coerces it
+# by truncating toward zero — measured: '800.94' is indexed as 800, '-1.5' as -1, '2.5' as 2, '3.5' as 3,
+# so it truncates rather than rounds. Solr rejects the document instead ("For input string: 800.94"),
+# and no shipped update processor closes the gap: ParseIntFieldUpdateProcessorFactory *skips* a value it
+# cannot parse, leaving the fraction to reach the field. clickbench's FlashMinor2 is declared short and
+# written with fractions, so without this the corpus cannot be indexed at all.
+_FRACTIONAL = re.compile(r"^-?\d+\.\d+$")
+
+# Solr field types with no fractional part. A field of one of these rejects "800.94".
+_INTEGRAL_TYPES = ("pint", "plong", "int", "long", "tint", "tlong", "sint", "slong")
+
+# Per collection, the fields whose declared type is integral. The schema is read once: a bulk operation
+# indexes hundreds of batches and asking per batch would put a schema request in the measured path.
+_INTEGER_FIELD_CACHE = {}
+
+
+def _integer_fields(client, collection):
+    """Return the names of *collection*'s fields whose declared type has no fractional part.
+
+    Coercion is driven by the declaration rather than by the value: a genuine floating-point field must
+    keep its fraction, and only a field the schema says is integral can be truncated safely.
+    """
+    if not collection:
+        return frozenset()
+    if collection in _INTEGER_FIELD_CACHE:
+        return _INTEGER_FIELD_CACHE[collection]
+    names = set()
+    try:
+        response = client.raw_request(
+            "GET", "/solr/%s/schema/fields?wt=json" % collection, None, {})
+        response.raise_for_status()
+        for field in response.json().get("fields", []):
+            if str(field.get("type", "")).lower() in _INTEGRAL_TYPES:
+                names.add(field.get("name"))
+    except Exception as error:  # pylint: disable=broad-except
+        # Without the schema, nothing is coerced — which is the previous behaviour, not a silent change
+        # of one: a document carrying a fraction is then rejected as loudly as before.
+        logging.getLogger(__name__).warning(
+            "Could not read %s's schema to find its integral fields (%s); no coercion applied.",
+            collection, error)
+        return frozenset()
+    result = frozenset(names)
+    _INTEGER_FIELD_CACHE[collection] = result
+    return result
+
+
+def _coerce_integer_fields(doc, integer_fields):
+    """Truncate a fractional value toward zero for each field declared integral.
+
+    *integer_fields* resolves the set of field names whose declared type has no fractional part. It is
+    a callable so the schema is fetched only when a document actually carries a fraction: a corpus with
+    none — every workload ported before clickbench — issues no schema request at all, keeping it out of
+    the measured path.
+
+    A field the schema does not call integral is left exactly as the corpus wrote it: coercing by value
+    rather than by declaration would silently truncate a genuine floating-point field.
+    """
+    if integer_fields is None:
+        return doc
+    candidates = [name for name, value in doc.items()
+                  if isinstance(value, float)
+                  or (isinstance(value, str) and _FRACTIONAL.match(value))]
+    if not candidates:
+        return doc
+    integral = integer_fields() if callable(integer_fields) else integer_fields
+    for name in candidates:
+        if name not in integral:
+            continue
+        value = doc[name]
+        doc[name] = int(value) if isinstance(value, float) else int(float(value))
+    return doc
 
 
 def _parse_bulk_pairs(first_action_line, lines_iter):
@@ -1458,7 +1550,8 @@ class SolrBulkIndex(SolrRunner):
         chain = params.get("update-chain") or params.get("pipeline")
         sc = client
 
-        doc_stream = _translate_ndjson_stream(corpus_lines)
+        doc_stream = _translate_ndjson_stream(
+            corpus_lines, lambda: _integer_fields(client, collection))
         total_docs = 0
         errors = 0
 
@@ -1625,7 +1718,8 @@ class SolrBinaryBulkIndex(SolrRunner):
 
         # Batched per target, as bulk-index does: a corpus may name a collection per document set.
         batches = {}
-        for doc, target in _translate_ndjson_stream(corpus_lines):
+        for doc, target in _translate_ndjson_stream(
+                corpus_lines, lambda: _integer_fields(client, collection)):
             target = target or collection
             if not target:
                 raise exceptions.DataError(

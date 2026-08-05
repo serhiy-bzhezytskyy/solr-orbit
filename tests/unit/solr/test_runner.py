@@ -775,6 +775,63 @@ class TestRunnerRegistrationSmoke(unittest.TestCase):
         self.assertEqual(5, result["hits"])
 
 
+class TestIntegerCoercion(unittest.TestCase):
+    """
+    A corpus may write a fraction where the mapping declares an integer.
+
+    OpenSearch coerces it by truncating toward zero — measured: '800.94' is indexed as 800, '-1.5' as
+    -1, '2.5' as 2, '3.5' as 3, so it truncates rather than rounds. Solr rejects the document instead
+    ("For input string: 800.94"), and no shipped processor closes the gap: ParseIntFieldUpdateProcessor
+    *skips* a value it cannot parse, leaving the fraction to reach the field. clickbench's FlashMinor2 is
+    declared short and written with fractions, so the corpus could not be indexed at all.
+    """
+
+    def test_a_fractional_string_is_truncated_toward_zero(self):
+        from solrorbit.worker_coordinator.runner import _coerce_integer_fields
+        doc = _coerce_integer_fields(
+            {"a": "800.94", "b": "-1.5", "c": "2.5", "d": "3.5"}, {"a", "b", "c", "d"})
+        self.assertEqual({"a": 800, "b": -1, "c": 2, "d": 3}, doc)
+
+    def test_a_float_is_truncated_too(self):
+        from solrorbit.worker_coordinator.runner import _coerce_integer_fields
+        self.assertEqual({"a": 800}, _coerce_integer_fields({"a": 800.94}, {"a"}))
+
+    def test_a_field_the_schema_does_not_call_integral_keeps_its_fraction(self):
+        # Coercing by value rather than by declaration would silently truncate a real float field.
+        from solrorbit.worker_coordinator.runner import _coerce_integer_fields
+        self.assertEqual({"price": "1.5"}, _coerce_integer_fields({"price": "1.5"}, {"other"}))
+
+    def test_a_whole_value_and_a_string_are_left_alone(self):
+        from solrorbit.worker_coordinator.runner import _coerce_integer_fields
+        doc = _coerce_integer_fields({"n": 7, "s": "text", "v": "1.2.3"}, {"n", "s", "v"})
+        self.assertEqual({"n": 7, "s": "text", "v": "1.2.3"}, doc)
+
+    def test_the_schema_is_not_read_when_no_value_carries_a_fraction(self):
+        # Every workload before clickbench has no such value; a schema request per batch would put it
+        # in the measured path for all of them.
+        from solrorbit.worker_coordinator.runner import _coerce_integer_fields
+        calls = []
+
+        def resolve():
+            calls.append(1)
+            return {"a"}
+
+        _coerce_integer_fields({"a": 7, "b": "text"}, resolve)
+        self.assertEqual([], calls)
+        _coerce_integer_fields({"a": "7.5"}, resolve)
+        self.assertEqual([1], calls)
+
+    def test_plain_ndjson_is_prepared_the_same_way_as_bulk_pairs(self):
+        # The plain branch used to flatten nothing, repair no timestamp and coerce nothing, so a corpus
+        # published without action lines was prepared differently from the same documents with them.
+        from solrorbit.worker_coordinator.runner import _translate_ndjson_stream
+        lines = ['{"outer": {"inner": 1}, "when": "2013-07-15 09:21:41", "n": "2.5"}']
+        docs = [doc for doc, _ in _translate_ndjson_stream(lines, lambda: {"n"})]
+        self.assertEqual(1, docs[0]["outer_inner"])
+        self.assertEqual("2013-07-15T09:21:41Z", docs[0]["when"])
+        self.assertEqual(2, docs[0]["n"])
+
+
 class TestSolrBinarySearch(unittest.TestCase):
     """
     A search whose response comes back in Solr's binary format.

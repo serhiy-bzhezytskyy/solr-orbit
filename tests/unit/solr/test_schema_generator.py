@@ -343,7 +343,10 @@ class TestNonIsoDateFormats(unittest.TestCase):
             "EventTime": {"type": "date",
                           "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_millis"},
         })
-        self.assertEqual(["yyyy-MM-dd HH:mm:ss"], formats)
+        # Both patterns are needed: "optional_time" accepts a date with the time left off, and Solr
+        # rejects that spelling — clickbench's EventDate is written that way and every real document was
+        # refused until the date-only pattern was added.
+        self.assertEqual(["yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss"], formats)
 
     def test_iso_and_epoch_contribute_nothing(self):
         # Solr parses ISO8601 natively, and an epoch number is handled by the field type.

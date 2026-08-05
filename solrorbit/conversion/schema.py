@@ -117,8 +117,13 @@ OPENSEARCH_TO_SOLR_TYPES = {
 # How an OpenSearch date format name or pattern is spelt for Solr's date parser, which takes
 # java.time patterns. The named ones OpenSearch resolves internally; the rest are already patterns.
 _NAMED_DATE_FORMATS = {
-    "strict_date_optional_time": None,   # ISO8601, which Solr parses natively
-    "date_optional_time": None,
+    # ⚠️ "optional_time" is the operative word: this format accepts a date with the time part left
+    # off, and Solr rejects that — "Invalid Date String:'2013-07-15'" — while accepting the same value
+    # with a time. clickbench's EventDate is written this way, so treating the format as natively
+    # parsed refused every real document. The date-only pattern is what the chain needs; the full
+    # ISO8601 spelling Solr already parses, so it contributes nothing.
+    "strict_date_optional_time": "yyyy-MM-dd",
+    "date_optional_time": "yyyy-MM-dd",
     "epoch_millis": None,                # a number, not a string: handled by the field type
     "epoch_second": None,
     "basic_date": "yyyyMMdd",
