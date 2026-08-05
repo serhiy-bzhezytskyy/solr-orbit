@@ -25,6 +25,62 @@ from solrorbit.conversion.schema import (
 )
 
 
+class TestNestedObjectMappings(unittest.TestCase):
+    """
+    A mapping entry holding nested properties is an object, not a field.
+
+    big5 declares agent, aws, cloud and the rest that way. Treating each as a field put the object's
+    name in the schema and none of its leaves, so indexing failed with
+    `undefined field: "aws_cloudwatch_log_stream"` — the name the documents and the queries both use.
+    """
+
+    def test_an_object_contributes_its_leaves(self):
+        fields, _ = translate_opensearch_mapping({
+            "agent": {"type": "object", "properties": {
+                "id": {"type": "keyword"},
+                "name": {"type": "keyword"},
+            }},
+        })
+        self.assertIn("agent_id", fields)
+        self.assertIn("agent_name", fields)
+        self.assertNotIn("agent", fields, "the object's own name is not a field")
+
+    def test_nesting_goes_all_the_way_down(self):
+        # big5 nests two levels: aws -> cloudwatch -> log_stream.
+        fields, _ = translate_opensearch_mapping({
+            "aws": {"type": "object", "properties": {
+                "cloudwatch": {"type": "object", "properties": {
+                    "log_stream": {"type": "keyword"},
+                }},
+            }},
+        })
+        self.assertIn("aws_cloudwatch_log_stream", fields)
+
+    def test_an_object_with_no_type_is_still_an_object(self):
+        # Some mappings omit the type and give only properties.
+        fields, _ = translate_opensearch_mapping({
+            "metrics": {"properties": {"size": {"type": "integer"}}},
+        })
+        self.assertIn("metrics_size", fields)
+
+    def test_an_open_object_becomes_a_dynamic_field(self):
+        # `"host": {"type": "object"}` accepts any sub-field upstream; Solr needs a declaration, and
+        # big5's documents carry host.name, which an operation collapses on.
+        fields, _ = translate_opensearch_mapping({"host": {"type": "object"}})
+        self.assertIn("host_*", fields)
+        self.assertTrue(fields["host_*"].get("dynamic"))
+
+    def test_a_dynamic_field_is_rendered_as_dynamicField(self):
+        xml = generate_schema_xml({"host_*": {"type": "string", "dynamic": True}})
+        self.assertIn('<dynamicField name="host_*"', xml)
+        self.assertNotIn('<field name="host_*"', xml)
+
+    def test_a_plain_field_is_still_rendered_as_field(self):
+        xml = generate_schema_xml({"status": {"type": "pint"}})
+        self.assertIn('<field name="status"', xml)
+        self.assertNotIn("dynamicField name=\"status\"", xml)
+
+
 class TestTranslateOpenSearchMapping(unittest.TestCase):
     """Test OpenSearch to Solr mapping translation."""
 

@@ -112,6 +112,36 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
     for field_name, field_config in properties.items():
         os_type = field_config.get("type")
 
+        # A mapping entry holding nested properties is an object, not a field: big5 declares agent,
+        # aws, cloud and the rest that way, each carrying the leaf fields the operations query. It may
+        # say so with "type": "object" or by omitting the type entirely, and either way what belongs in
+        # the schema are the leaves. Treating the entry as a field declared the object's name and none
+        # of its leaves, so indexing failed with `undefined field: "aws_cloudwatch_log_stream"`.
+        # Recurse and prefix with an underscore, the way documents are flattened and field names
+        # normalised.
+        # An object with no properties at all accepts any sub-field dynamically. Upstream allows that;
+        # Solr needs a declaration, so one dynamic field stands in for the whole subtree. big5 writes
+        # `"host": {"type": "object"}` and its documents carry host.name, which an operation collapses
+        # on — the field is used, just never declared.
+        if os_type in ("object", "nested") and not field_config.get("properties"):
+            solr_fields["%s_*" % str(field_name).replace(".", "_")] = {
+                "type": "string",
+                "indexed": True,
+                "stored": True,
+                "docValues": True,
+                "dynamic": True,
+            }
+            continue
+
+        if os_type in (None, "object", "nested") and isinstance(field_config.get("properties"), dict):
+            nested_fields, nested_copies = translate_opensearch_mapping(field_config["properties"])
+            prefix = str(field_name).replace(".", "_")
+            for nested_name, nested_def in nested_fields.items():
+                solr_fields["%s_%s" % (prefix, nested_name)] = nested_def
+            for source, dest in nested_copies:
+                copy_fields.append(("%s_%s" % (prefix, source), "%s_%s" % (prefix, dest)))
+            continue
+
         if not os_type:
             logger.warning(f"Field '{field_name}' has no type, skipping")
             continue
@@ -238,7 +268,10 @@ def generate_schema_xml(field_defs: Dict[str, Dict[str, Any]],
         if doc_values is not None:
             attrs.append(f'docValues="{str(doc_values).lower()}"')
 
-        fields_xml.append(f'  <field {" ".join(attrs)} />')
+        # A dynamic field stands in for a subtree upstream left open, so it needs the dynamicField
+        # element rather than field — Solr matches the pattern against names it has no declaration for.
+        element = "dynamicField" if field_config.get("dynamic") else "field"
+        fields_xml.append(f'  <{element} {" ".join(attrs)} />')
 
     # Build copyField directives XML
     copy_fields_xml = []
