@@ -1335,6 +1335,11 @@ def _flatten_document(doc, prefix="", separator="_"):
 
     out = {}
     for key, value in doc.items():
+        # A key may itself contain dots. big5 writes a literal "aws.cloudwatch" key holding an object,
+        # so the path is normalised the way the query side normalises a field name — every dot becomes
+        # an underscore — or the documents would carry aws.cloudwatch_log_stream while the operations
+        # ask for aws_cloudwatch_log_stream.
+        key = str(key).replace(".", separator)
         name = "%s%s%s" % (prefix, separator, key) if prefix else key
         if isinstance(value, dict):
             keys = set(value)

@@ -263,6 +263,20 @@ class TestFlattenDocument(unittest.TestCase):
         self.assertNotIn("TRANGE", flat)
         self.assertEqual({"TRANGE_gte": 18.8, "TRANGE_lte": 29.3}, flat)
 
+    def test_a_dotted_key_normalises_like_a_queried_field_name(self):
+        # big5 writes a literal "aws.cloudwatch" key holding an object. The query side turns
+        # aws.cloudwatch.log_stream into aws_cloudwatch_log_stream, so the document has to arrive
+        # under that name — otherwise the operations search a field nothing wrote.
+        flat = _flatten_document({"aws.cloudwatch": {"log_stream": "madeye"}})
+        self.assertIn("aws_cloudwatch_log_stream", flat)
+        self.assertEqual("madeye", flat["aws_cloudwatch_log_stream"])
+        self.assertEqual("aws_cloudwatch_log_stream", normalize_field_name("aws.cloudwatch.log_stream"))
+
+    def test_an_at_prefixed_key_survives(self):
+        # @timestamp holds no dot, so normalisation leaves it as it is — and the operations name it
+        # exactly that way.
+        self.assertEqual({"@timestamp": "x"}, _flatten_document({"@timestamp": "x"}))
+
     def test_a_flat_document_is_unchanged(self):
         doc = {"TAVG": 22.9, "id": "1"}
         self.assertEqual(doc, _flatten_document(doc))
