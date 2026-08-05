@@ -44,6 +44,7 @@ import requests
 from solrorbit import exceptions, workload
 from solrorbit.client import RequestContextHolder, CollectionAlreadyExistsError, CollectionNotFoundError
 from solrorbit.telemetry import _parse_prometheus_text
+from solrorbit.utils import javabin
 from solrorbit.utils.javabin import encode_update_request
 
 __RUNNERS = {}
@@ -88,6 +89,12 @@ def register_default_runners():
     register_runner("binary-bulk-index", _binary_bulk, async_runner=True)
     register_runner("proto-bulk", _binary_bulk, async_runner=True)
     register_runner("raw-request", RawRequest(), async_runner=True)
+    # A search over a binary protocol has no Solr equivalent transport, but it does have an equivalent
+    # response encoding. Leaving proto-search unregistered made the operation fail to load with no
+    # runner at all, so the workload silently carried three operations that could never run.
+    _binary_search = SolrBinarySearch()
+    register_runner("binary-search", _binary_search, async_runner=True)
+    register_runner("proto-search", _binary_search, async_runner=True)
     _paginated_runner = SolrPaginatedSearch()
     register_runner("paginated-search", _paginated_runner, async_runner=True)
     register_runner("scroll-search", _paginated_runner, async_runner=True)
@@ -1753,6 +1760,58 @@ class SolrSearch(SolrRunner):
 
     def __str__(self):
         return "solr-search"
+
+
+class SolrBinarySearch(SolrSearch):
+    """
+    Execute a search whose response comes back in Solr's binary format rather than JSON.
+
+    A workload may compare a binary search transport against JSON — big5 does, via its gRPC search
+    operations. Solr has no gRPC endpoint, but every request handler writes ``wt=javabin``, so the
+    comparable measurement is the same query over the same endpoint with a binary response writer.
+
+    The body is a Solr JSON query as for ``search``; only the response encoding differs. Decoding it
+    is what makes the measurement honest: a runner that requested javabin and then ignored the bytes
+    would report the transport's latency without ever paying its parsing cost, which is most of what
+    distinguishes the two.
+    """
+
+    async def __call__(self, client, params):
+        collection = _get_collection(params)
+        params = self._substitute_published_ids(params, params.get("id-field", "id"))
+        body = params.get("body")
+
+        start = time.perf_counter()
+        if body is not None:
+            resp = await _run_in_executor(
+                client.raw_request, "POST", f"/solr/{collection}/query?wt=javabin", body,
+                {"Content-Type": "application/json"}
+            )
+        else:
+            query = {"q": params.get("q", "*:*")}
+            for key in ("fl", "rows", "fq", "sort"):
+                if key in params:
+                    query[key] = params[key]
+            query.update(params.get("request-params", {}))
+            path = "/solr/%s/select?%s&wt=javabin" % (collection, urllib.parse.urlencode(query, doseq=True))
+            resp = await _run_in_executor(client.raw_request, "GET", path, None, {})
+        resp.raise_for_status()
+        decoded = javabin.decode_response(resp.content)
+        elapsed = time.perf_counter() - start
+
+        response = decoded.get("response") or {}
+        return {
+            "weight": 1,
+            "unit": "ops",
+            "success": True,
+            "hits": response.get("numFound", 0),
+            "hits_relation": "eq",
+            "timed_out": False,
+            "took": elapsed,
+        }
+
+    def __str__(self):
+        return "solr-binary-search"
 
 
 # ---------------------------------------------------------------------------

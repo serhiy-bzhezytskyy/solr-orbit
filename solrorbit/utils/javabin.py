@@ -237,3 +237,145 @@ class JavaBinWriter:
 def encode_update_request(docs, params=None, commit_within=None):
     """Encode *docs* as a javabin add-documents request. One writer per request."""
     return JavaBinWriter().update_request(docs, params=params, commit_within=commit_within)
+
+
+class JavaBinReader:
+    """
+    Decode a javabin response.
+
+    Only what a search response needs: the reader must handle every tag Solr may emit in one, since a
+    tag it skips desynchronises everything after it. The extern-string table is rebuilt in the order
+    the writer filled it, so an instance decodes exactly one response.
+    """
+
+    def __init__(self, data):
+        self._in = io.BytesIO(data)
+        self._extern = []
+
+    def _byte(self):
+        b = self._in.read(1)
+        if not b:
+            raise EOFError("javabin response ended mid-value")
+        return b[0]
+
+    def _vint(self):
+        shift = 0
+        value = 0
+        while True:
+            b = self._byte()
+            value |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return value
+            shift += 7
+
+    def _size(self, tag_byte, tag):
+        size = tag_byte & 0x1F
+        if size == 0x1F:
+            size += self._vint()
+        return size
+
+    def _string(self, size):
+        return self._in.read(size).decode("utf-8")
+
+    def read(self):
+        """Read the version byte and return the top-level value."""
+        self._byte()  # version
+        return self._value()
+
+    def _value(self):
+        import struct
+        tag_byte = self._byte()
+        tag = tag_byte & 0xE0
+        if tag:
+            # SINT and SLONG pack a *value* into the low five bits, not a length: reading them as a
+            # length consumed the varint that carried the rest of the value, and every field after it
+            # decoded as garbage. It only shows on a value whose low nibble is 0x0f, which is why a
+            # response could decode correctly and then break on the next document.
+            if tag == SINT or tag == SLONG:
+                value = tag_byte & 0x0F
+                if tag_byte & 0x10:
+                    shift = 4
+                    while True:
+                        b = self._byte()
+                        value |= (b & 0x7F) << shift
+                        if not b & 0x80:
+                            break
+                        shift += 7
+                return value
+            size = self._size(tag_byte, tag)
+            if tag == STR:
+                return self._string(size)
+            if tag == ARR:
+                return [self._value() for _ in range(size)]
+            if tag in (ORDERED_MAP, NAMED_LST):
+                # A NamedList allows repeated names, so it decodes to a dict only because a search
+                # response never repeats one at a level that matters here.
+                return {self._extern_string(): self._value() for _ in range(size)}
+            if tag == EXTERN_STRING:
+                return self._extern_at(size)
+            raise ValueError("unhandled javabin tag 0x%02x" % tag_byte)
+
+        if tag_byte == NULL:
+            return None
+        if tag_byte == BOOL_TRUE:
+            return True
+        if tag_byte == BOOL_FALSE:
+            return False
+        if tag_byte == BYTE:
+            return int.from_bytes(self._in.read(1), "big", signed=True)
+        if tag_byte == SHORT:
+            return int.from_bytes(self._in.read(2), "big", signed=True)
+        if tag_byte == DOUBLE:
+            return struct.unpack(">d", self._in.read(8))[0]
+        if tag_byte == INT:
+            return int.from_bytes(self._in.read(4), "big", signed=True)
+        if tag_byte == LONG:
+            return int.from_bytes(self._in.read(8), "big", signed=True)
+        if tag_byte == FLOAT:
+            return struct.unpack(">f", self._in.read(4))[0]
+        if tag_byte == DATE:
+            millis = int.from_bytes(self._in.read(8), "big", signed=True)
+            return datetime.datetime.fromtimestamp(millis / 1000.0, datetime.timezone.utc)
+        if tag_byte == MAP:
+            size = self._vint()
+            return {self._value(): self._value() for _ in range(size)}
+        if tag_byte in (SOLRDOC, SOLRINPUTDOC):
+            return self._value()
+        if tag_byte == SOLRDOCLST:
+            # A document list is a three-element header - numFound, start, maxScore - then the docs.
+            header = self._value()
+            docs = self._value()
+            return {"numFound": header[0], "start": header[1], "maxScore": header[2], "docs": docs}
+        if tag_byte == BYTEARR:
+            return self._in.read(self._vint())
+        if tag_byte == ITERATOR:
+            items = []
+            while True:
+                mark = self._in.tell()
+                if self._byte() == END:
+                    return items
+                self._in.seek(mark)
+                items.append(self._value())
+        if tag_byte == END:
+            return None
+        raise ValueError("unhandled javabin tag 0x%02x" % tag_byte)
+
+    def _extern_string(self):
+        tag_byte = self._byte()
+        if tag_byte & 0xE0 != EXTERN_STRING:
+            self._in.seek(-1, io.SEEK_CUR)
+            return self._value()
+        return self._extern_at(self._size(tag_byte, EXTERN_STRING))
+
+    def _extern_at(self, index):
+        if index == 0:
+            # A first occurrence carries the string, which then joins the table.
+            value = self._value()
+            self._extern.append(value)
+            return value
+        return self._extern[index - 1]
+
+
+def decode_response(data):
+    """Decode a javabin response body. One reader per response."""
+    return JavaBinReader(data).read()

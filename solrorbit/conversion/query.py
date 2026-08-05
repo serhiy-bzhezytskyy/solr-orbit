@@ -26,6 +26,7 @@ Native Solr workloads should not go through this translation layer.
 """
 
 import logging
+import re
 from datetime import datetime
 
 from .field import normalize_field_name
@@ -157,6 +158,39 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
                 continue
             field = normalize_field_name(field)
             return _translate_terms_clause(field, values)
+
+    if "query_string" in node or "simple_query_string" in node:
+        # A query string is already Lucene syntax on the OpenSearch side, and Solr's default parser
+        # reads the same syntax — what differs is the field spelling and how a default field is named.
+        # Untranslated this fell through to *:* and the operation matched the whole corpus: 3,482,624
+        # documents where the query selects 298,029.
+        sub = node.get("query_string") or node.get("simple_query_string")
+        if isinstance(sub, dict) and isinstance(sub.get("query"), str):
+            query = sub["query"]
+            fields = sub.get("fields")
+            # `message: monkey jackal bear` names its field inline and then lists several terms. Solr
+            # binds a bare field reference to the *next* term only, and answers "no field name
+            # specified in query and no default specified via 'df' param" for the rest, so the terms
+            # that follow are grouped. Both engines then report 298,029.
+            inline = re.match(r"^\s*([A-Za-z_][\w.]*)\s*:\s*(.+)$", query, re.DOTALL)
+            if inline and not re.search(r"[():\[\]]", inline.group(2)):
+                terms = inline.group(2).strip()
+                field = normalize_field_name(inline.group(1))
+                return "%s:(%s)" % (field, terms) if " " in terms else "%s:%s" % (field, terms)
+            query = re.sub(r"([A-Za-z_][\w.]*)\s*:\s*",
+                           lambda m: "%s:" % normalize_field_name(m.group(1)), query)
+            if isinstance(fields, list) and fields:
+                # Several fields with no inline field reference: Solr states that with edismax's qf.
+                if ":" not in query:
+                    names = " ".join(normalize_field_name(f) for f in fields)
+                    return "{!edismax qf=\"%s\"}%s" % (names, query)
+            default_field = sub.get("default_field")
+            if default_field and ":" not in query:
+                return "%s:(%s)" % (normalize_field_name(default_field), query)
+            return query
+        logger.warning(
+            "A query_string node carries no query string: %s. Falling back to q=*:*.", node)
+        return "*:*"
 
     if "match" in node or "match_phrase" in node:
         sub = node.get("match") or node.get("match_phrase")
@@ -321,6 +355,10 @@ def _escape_solr_phrase(value) -> str:
     return str(value).replace('\\', '\\\\').replace('"', '\\"')
 
 
+# The tag a post_filter's filter query carries, so the facets can exclude it by name.
+_POST_FILTER_TAG = "postfilter"
+
+
 def translate_to_solr_json_dsl(body: dict) -> dict:
     """
     Translate an OpenSearch query body to Solr JSON Query DSL format.
@@ -354,6 +392,16 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
 
     result = {"query": q}
 
+    # A post_filter narrows the hits *after* the aggregations have been computed, so the facets see
+    # the unfiltered set and the hit count sees the filtered one. Dropped entirely, the operation
+    # reported 103,349 hits where upstream reports 4,199. Solr's equivalent is a filter tagged and
+    # excluded from the facets, which is what {!tag} plus a facet domain excludeTags does.
+    post_filter = body.get("post_filter")
+    if isinstance(post_filter, dict):
+        post_fq = _translate_query_node(post_filter)
+        if post_fq and post_fq != "*:*":
+            fq_list = list(fq_list) + ["{!tag=%s}%s" % (_POST_FILTER_TAG, post_fq)]
+
     if fq_list:
         result["filter"] = fq_list
 
@@ -368,6 +416,15 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
     if aggs and isinstance(aggs, dict):
         facets = _convert_aggregations_to_facets(aggs, _date_bounds_from_query(body))
         if facets:
+            # A post_filter is by definition not applied to the aggregations. Each top-level facet
+            # excludes it by the tag the filter carries; without this the facets would be computed over
+            # the narrowed set, which is the very thing a post_filter exists to avoid.
+            if isinstance(post_filter, dict) and "filter" in result:
+                for facet in facets.values():
+                    if isinstance(facet, dict):
+                        domain = dict(facet.get("domain") or {})
+                        domain["excludeTags"] = _POST_FILTER_TAG
+                        facet["domain"] = domain
             result["facet"] = facets
 
     return result

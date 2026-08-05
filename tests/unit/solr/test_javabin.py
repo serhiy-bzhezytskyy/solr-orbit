@@ -230,3 +230,96 @@ class TestJavaBinUpdateRequest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJavaBinReader:
+    """Decode what the writer wrote, and what a real response looked like."""
+
+    def test_a_round_trip_recovers_every_scalar_type(self):
+        from solrorbit.utils.javabin import JavaBinWriter, decode_response
+        writer = JavaBinWriter()
+        writer._byte(javabin.VERSION)
+        writer._value({"i": 7, "l": 2 ** 40, "s": "text", "b": True,
+                       "n": None, "d": 1.5, "arr": [1, 2, 3]})
+        decoded = decode_response(writer._out.getvalue())
+        assert decoded == {"i": 7, "l": 2 ** 40, "s": "text", "b": True,
+                           "n": None, "d": 1.5, "arr": [1, 2, 3]}
+
+    def test_a_document_list_decodes_to_its_header_and_docs(self):
+        # A response's hit count lives in the SOLRDOCLST header; a reader that skipped it would report
+        # zero hits for every binary search.
+        from solrorbit.utils.javabin import decode_response
+        # version, NAMED_LST of one entry "response" -> SOLRDOCLST(numFound=3, start=0, maxScore=null,
+        # docs=[]), written by hand so the test does not depend on the writer emitting a doc list.
+        import io
+        out = io.BytesIO()
+        out.write(bytes([javabin.VERSION]))
+        out.write(bytes([javabin.NAMED_LST | 1]))
+        out.write(bytes([javabin.EXTERN_STRING | 0]))
+        name = "response".encode("utf-8")
+        out.write(bytes([javabin.STR | len(name)]))
+        out.write(name)
+        out.write(bytes([javabin.SOLRDOCLST]))
+        out.write(bytes([javabin.ARR | 3]))
+        out.write(bytes([javabin.SLONG | 0x03]))   # numFound = 3
+        out.write(bytes([javabin.SLONG | 0x00]))   # start = 0
+        out.write(bytes([javabin.NULL]))           # maxScore
+        out.write(bytes([javabin.ARR | 0]))        # docs
+        decoded = decode_response(out.getvalue())
+        assert decoded["response"]["numFound"] == 3
+        assert decoded["response"]["docs"] == []
+
+    def test_a_packed_int_is_a_value_not_a_length(self):
+        # SINT/SLONG pack the value into the same low bits a length uses. Reading them as a length
+        # consumed the varint carrying the rest of the value and every field after it decoded as
+        # garbage: a live response reported metrics_size 91663 where it was 1855. It only shows when
+        # the low nibble is 0x0f, so most values decoded correctly and the failure looked sporadic.
+        import io
+        from solrorbit.utils.javabin import decode_response
+        for value in (0, 1, 14, 15, 16, 31, 1855, 91663, 2 ** 20):
+            out = io.BytesIO()
+            out.write(bytes([javabin.VERSION]))
+            # Write it the way solrj's writeSInt does: four bits in the tag, continuation flag at 0x10.
+            if value < 0x10:
+                out.write(bytes([javabin.SINT | value]))
+            else:
+                out.write(bytes([javabin.SINT | 0x10 | (value & 0x0F)]))
+                remaining = value >> 4
+                while remaining > 0x7F:
+                    out.write(bytes([(remaining & 0x7F) | 0x80]))
+                    remaining >>= 7
+                out.write(bytes([remaining]))
+            assert decode_response(out.getvalue()) == value, value
+
+    def test_a_packed_int_does_not_desynchronise_what_follows_it(self):
+        # The symptom that mattered: the *next* value was wrong, not this one.
+        import io
+        from solrorbit.utils.javabin import decode_response
+        out = io.BytesIO()
+        out.write(bytes([javabin.VERSION]))
+        out.write(bytes([javabin.ARR | 2]))
+        out.write(bytes([javabin.SINT | 0x10 | 0x0F]))   # 1855 = 0x73F -> low nibble 0xF
+        out.write(bytes([0x73]))
+        marker = "after".encode("utf-8")
+        out.write(bytes([javabin.STR | len(marker)]))
+        out.write(marker)
+        assert decode_response(out.getvalue()) == [1855, "after"]
+
+    def test_a_repeated_extern_string_resolves_by_its_table_index(self):
+        # The second occurrence of a name is a *reference* into the table, not the name again: a
+        # response repeats every field name once per document. An off-by-one in the table lookup
+        # returns the wrong name, or walks off the end.
+        from solrorbit.utils.javabin import JavaBinWriter, decode_response
+        writer = JavaBinWriter()
+        writer._byte(javabin.VERSION)
+        writer._tag(javabin.ARR, 2)
+        # Two documents carrying the same two field names, so the second document's names are
+        # references rather than literals.
+        for value in (1, 2):
+            writer._tag(javabin.NAMED_LST, 2)
+            writer._extern_str("first")
+            writer._value(value)
+            writer._extern_str("second")
+            writer._value(value)
+        decoded = decode_response(writer._out.getvalue())
+        assert decoded == [{"first": 1, "second": 1}, {"first": 2, "second": 2}]

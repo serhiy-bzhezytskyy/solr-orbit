@@ -775,5 +775,62 @@ class TestRunnerRegistrationSmoke(unittest.TestCase):
         self.assertEqual(5, result["hits"])
 
 
+class TestSolrBinarySearch(unittest.TestCase):
+    """
+    A search whose response comes back in Solr's binary format.
+
+    Mocks here return a real encoded response rather than a bare Mock: a Mock says yes to any
+    attribute, so a runner reading the wrong one would still look like it worked.
+    """
+
+    def _client_returning(self, payload):
+        from solrorbit.utils.javabin import JavaBinWriter, VERSION
+        writer = JavaBinWriter()
+        writer._byte(VERSION)
+        writer._value(payload)
+        encoded = writer._out.getvalue()
+
+        response = MagicMock()
+        response.content = encoded
+        response.raise_for_status.return_value = None
+        client = MagicMock()
+        client.raw_request.return_value = response
+        return client, response
+
+    def test_the_hit_count_is_read_from_the_decoded_response(self):
+        from solrorbit.worker_coordinator.runner import SolrBinarySearch
+        client, _ = self._client_returning(
+            {"response": {"numFound": 42, "start": 0, "docs": []}})
+        result = _run(SolrBinarySearch()(client, {"collection": "c", "body": {"query": "*:*"}}))
+        self.assertEqual(42, result["hits"])
+        self.assertTrue(result["success"])
+
+    def test_the_binary_response_writer_is_requested(self):
+        # Without wt=javabin Solr answers JSON and the measurement is not the binary transport at all.
+        from solrorbit.worker_coordinator.runner import SolrBinarySearch
+        client, _ = self._client_returning({"response": {"numFound": 1, "start": 0, "docs": []}})
+        _run(SolrBinarySearch()(client, {"collection": "c", "body": {"query": "*:*"}}))
+        path = client.raw_request.call_args[0][1]
+        self.assertIn("wt=javabin", path)
+
+    def test_a_query_without_a_body_goes_through_select_with_its_params(self):
+        from solrorbit.worker_coordinator.runner import SolrBinarySearch
+        client, _ = self._client_returning({"response": {"numFound": 7, "start": 0, "docs": []}})
+        result = _run(SolrBinarySearch()(
+            client, {"collection": "c", "q": "process_name:kernel", "rows": 3}))
+        path = client.raw_request.call_args[0][1]
+        self.assertIn("/solr/c/select", path)
+        self.assertIn("rows=3", path)
+        self.assertEqual(7, result["hits"])
+
+    def test_proto_search_resolves_to_the_binary_search_runner(self):
+        # Unregistered, the operation failed to load with no runner at all, so three big5 operations
+        # could never run.
+        from solrorbit.worker_coordinator.runner import register_default_runners, runner_for
+        register_default_runners()
+        self.assertIsNotNone(runner_for("proto-search"))
+        self.assertIsNotNone(runner_for("binary-search"))
+
+
 if __name__ == "__main__":
     unittest.main()

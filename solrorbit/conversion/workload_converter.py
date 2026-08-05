@@ -41,6 +41,7 @@ import shutil
 from datetime import datetime
 
 from .detector import is_opensearch_workload
+from .ppl import source_index, translate_ppl_to_sql
 from .query import translate_to_solr_json_dsl
 
 logger = logging.getLogger(__name__)
@@ -277,6 +278,12 @@ def _parse_jinja_fragment(text: str, wrap_array: bool = False):
     cannot be parsed even after substitution.
     """
     modified, tokens = _jinja_substitute(text)
+    # A conversion that has to *read* a value, not just move it, needs the source text behind the
+    # placeholder: a piped query is one whole string literal containing an expression, so the parsed
+    # value is the bare placeholder and translating it produced nothing. Publish the token list for
+    # the duration of this fragment's conversion.
+    global _JINJA_TOKENS
+    _JINJA_TOKENS = tokens
     to_parse = f"[{modified}]" if wrap_array else modified
     try:
         parsed = json.loads(to_parse)
@@ -375,6 +382,10 @@ CONVERTED_MARKER = "CONVERTED.md"
 # is missing" unless the converter fills it in.
 _TARGET_COLLECTION = None
 
+# The Jinja tokens of the fragment currently being converted, or None outside one.
+_JINJA_TOKENS = None
+_PLACEHOLDER_RE = re.compile(r'^__J_(\d+)__$')
+
 
 _OP_MAP = {
     "bulk": "bulk-index",
@@ -384,6 +395,10 @@ _OP_MAP = {
     "create-index": "create-collection",
     "delete-index": "delete-collection",
     "raw-request": "raw-request",
+    # A search or bulk over OpenSearch's binary protocol keeps its type name so the workload loads
+    # unchanged; the runner answers it with Solr's binary response writer / update format.
+    "proto-search": "proto-search",
+    "proto-bulk": "proto-bulk",
     "sleep": "sleep",
     # A refresh makes recent writes searchable; in Solr that is a commit.
     "refresh": "commit",
@@ -392,7 +407,7 @@ _OP_MAP = {
 # Operations that act on one collection and must be told which.
 _COLLECTION_SCOPED_OPS = {
     "commit", "optimize", "wait-for-merges", "create-collection", "delete-collection",
-    "bulk-index", "search", "paginated-search", "scroll-search",
+    "bulk-index", "search", "paginated-search", "scroll-search", "proto-search",
 }
 
 # Operations that have no meaningful Solr equivalent (skipped with a note)
@@ -1009,7 +1024,7 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
     # translation on a dict "query" left such bodies in OpenSearch syntax, where "size" and "aggs"
     # mean nothing to Solr. The operation then loads and answers, with the aggregation silently
     # absent. Translate whenever there is anything to translate.
-    if op_type in ("search", "paginated-search", "scroll-search"):
+    if op_type in ("search", "paginated-search", "scroll-search", "proto-search"):
         body = op.get("body")
         translatable = isinstance(body, dict) and (
             isinstance(body.get("query"), dict)
@@ -1039,7 +1054,69 @@ def _convert_operation(op, issues, skipped, source_dir, output_dir):
                 except Exception as exc:
                     issues.append(f"Could not translate body file '{body_file}': {exc}")
 
+    # A raw request to the piped-query endpoint is a query, not an opaque request: leaving it verbatim
+    # produced an operation that sends OpenSearch's own piped syntax to Solr, which answers 404. Solr's
+    # equivalent surface is the SQL module, so the piped query becomes a SQL statement.
+    if op.get("operation-type") == "raw-request" and _is_ppl_request(op):
+        _convert_ppl_operation(op, issues, skipped)
+
     return True
+
+
+def _is_ppl_request(op):
+    """Say whether a raw request targets the piped-query endpoint."""
+    path = op.get("path") or ""
+    body = op.get("body")
+    return "_ppl" in path and isinstance(body, dict) and isinstance(body.get("query"), str)
+
+
+def _resolve_placeholder(value):
+    """Return the source text a placeholder stands for, or *value* unchanged.
+
+    A value that is exactly one placeholder was a string literal carrying a Jinja expression. The
+    expression is left in the resolved text: it renders at load time, so a translated statement can
+    carry it where the collection name belongs.
+    """
+    if not isinstance(value, str) or _JINJA_TOKENS is None:
+        return value
+    match = _PLACEHOLDER_RE.match(value)
+    if not match:
+        return value
+    index = int(match.group(1))
+    if index >= len(_JINJA_TOKENS):
+        return value
+    return _JINJA_TOKENS[index][0]
+
+
+def _convert_ppl_operation(op, issues, skipped):
+    """Rewrite a piped-query operation into a Solr SQL one, in place.
+
+    The statement goes to ``/solr/<collection>/sql``, which reads it from a request parameter rather
+    than a JSON body — hence ``form``. A query Solr SQL cannot express is recorded as an issue and the
+    operation is left as it was, so the conversion report names it instead of the workload carrying a
+    statement that measures something else.
+    """
+    op_name = op.get("name", "?")
+    query = _resolve_placeholder(op["body"]["query"])
+    # The index the query itself names comes first: it may be a Jinja expression, and a workload that
+    # lets its index be overridden at load time would be pinned to whatever the conversion was given.
+    collection = (_resolve_placeholder(op.get("collection"))
+                  or source_index(query)
+                  or _TARGET_COLLECTION)
+    statement = translate_ppl_to_sql(query, collection=collection)
+    if statement is None:
+        issues.append(
+            "Operation '%s' is a piped query using an operator Solr SQL has no spelling for "
+            "(a date span or a computed case); left untranslated." % op_name
+        )
+        return
+    if not collection:
+        issues.append("Piped operation '%s' has no collection to query." % op_name)
+        return
+    op["path"] = "/solr/%s/sql" % collection
+    op["method"] = "POST"
+    op["body"] = {"stmt": statement}
+    op["form"] = True
 
 
 def _copy_auxiliary_files(source_dir: str, output_dir: str, skip_files: set = None):

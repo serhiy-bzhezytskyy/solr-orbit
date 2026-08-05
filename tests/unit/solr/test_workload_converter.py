@@ -22,6 +22,7 @@ import os
 import tempfile
 import unittest
 
+from solrorbit.conversion import workload_converter as wc
 from solrorbit.conversion.workload_converter import (
     CONVERTED_MARKER,
     _jinja_restore,
@@ -750,3 +751,124 @@ class TestHttpLogsShapedFragmentParses(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPipedAndProtoOperations:
+    """A piped query and a binary-protocol search are queries, not opaque requests."""
+
+    def test_a_piped_raw_request_becomes_a_solr_sql_operation(self):
+        op = {"name": "ppl-term", "operation-type": "raw-request", "path": "/_plugins/_ppl",
+              "method": "POST",
+              "body": {"query": "source = big5 | where `process.name` = 'kernel' | head 10"}}
+        issues, skipped = [], []
+        wc._TARGET_COLLECTION = "big5"
+        assert wc._convert_operation(op, issues, skipped, "", "") is True
+        assert op["path"] == "/solr/big5/sql"
+        assert op["form"] is True
+        assert op["body"]["stmt"] == \
+            "select id from big5 where (process_name = 'kernel') limit 10"
+
+    def test_a_piped_query_sql_cannot_express_is_reported_not_mistranslated(self):
+        op = {"name": "ppl-histo", "operation-type": "raw-request", "path": "/_plugins/_ppl",
+              "method": "POST",
+              "body": {"query": "source = big5 | stats count() by span(`@timestamp`, 1d)"}}
+        issues, skipped = [], []
+        wc._TARGET_COLLECTION = "big5"
+        wc._convert_operation(op, issues, skipped, "", "")
+        assert op["path"] == "/_plugins/_ppl"
+        assert any("ppl-histo" in issue for issue in issues)
+
+    def test_a_non_piped_raw_request_is_left_alone(self):
+        op = {"name": "health", "operation-type": "raw-request", "method": "GET",
+              "path": "/solr/admin/collections?action=CLUSTERSTATUS"}
+        wc._convert_operation(op, [], [], "", "")
+        assert op["path"] == "/solr/admin/collections?action=CLUSTERSTATUS"
+        assert "form" not in op
+
+    def test_a_proto_search_body_is_translated_like_a_search_body(self):
+        # Left untranslated the operation shipped OpenSearch DSL to Solr, which answers it as a
+        # syntactically valid query matching nothing.
+        op = {"name": "grpc-term", "operation-type": "proto-search",
+              "body": {"query": {"term": {"process.name": {"value": "kernel"}}}}}
+        wc._TARGET_COLLECTION = "big5"
+        wc._convert_operation(op, [], [], "", "")
+        assert op["operation-type"] == "proto-search"
+        assert "term" not in json.dumps(op["body"])
+        assert op["collection"] == "big5"
+
+    def test_a_piped_query_inside_a_jinja_fragment_is_translated(self):
+        # The parsed value of a literal carrying an expression is a bare placeholder, so translating
+        # it produced nothing at all and every piped operation was reported untranslatable.
+        text = ('{"name": "ppl-default", "operation-type": "raw-request", '
+                '"path": "/_plugins/_ppl", "method": "POST", '
+                '"body": {"query": "source = {{index_name | default(\'big5\')}} | head 10"}}')
+        wc._TARGET_COLLECTION = "big5"
+        converted = wc._convert_operations_text(text) if hasattr(wc, "_convert_operations_text") \
+            else None
+        if converted is None:
+            parsed, tokens = wc._parse_jinja_fragment(text)
+            wc._convert_operation(parsed, [], [], "", "")
+            converted = wc._serialise_jinja_fragment(parsed, tokens)
+        # The expression survives in both the path and the statement: substituting the collection the
+        # conversion happened to be given would pin an index the workload lets its caller override.
+        assert "/solr/{{index_name | default('big5')}}/sql" in converted
+        assert "select id from {{index_name | default('big5')}} limit 10" in converted
+        assert "head 10" not in converted
+
+
+class TestQueryStringAndPostFilter(unittest.TestCase):
+    """Two query forms that fell through to *:* or were dropped, each measuring the wrong thing."""
+
+    def test_a_query_string_with_an_inline_field_groups_its_terms(self):
+        # Untranslated this fell through to *:*: 3,482,624 documents where the query selects 298,029.
+        # Solr binds a bare field reference to the next term only and rejects the rest with "no field
+        # name specified in query", so the terms are grouped.
+        body = translate_to_solr_json_dsl(
+            {"query": {"query_string": {"query": "message: monkey jackal bear"}}})
+        self.assertEqual("message:(monkey jackal bear)", body["query"])
+
+    def test_a_single_term_query_string_needs_no_grouping(self):
+        body = translate_to_solr_json_dsl({"query": {"query_string": {"query": "message: monkey"}}})
+        self.assertEqual("message:monkey", body["query"])
+
+    def test_a_query_string_field_name_is_flattened(self):
+        body = translate_to_solr_json_dsl(
+            {"query": {"query_string": {"query": "log.file.path: /var/log/x"}}})
+        self.assertEqual("log_file_path:/var/log/x", body["query"])
+
+    def test_a_query_string_over_several_fields_uses_edismax(self):
+        body = translate_to_solr_json_dsl(
+            {"query": {"query_string": {"query": "monkey", "fields": ["message", "process.name"]}}})
+        self.assertIn('qf="message process_name"', body["query"])
+
+    def test_a_query_string_already_carrying_operators_is_left_intact(self):
+        body = translate_to_solr_json_dsl(
+            {"query": {"query_string": {"query": "message:(a b) AND process.name:kernel"}}})
+        self.assertEqual("message:(a b) AND process_name:kernel", body["query"])
+
+    def test_a_post_filter_becomes_a_tagged_filter(self):
+        # Dropped entirely, the operation reported 103,349 hits where upstream reports 4,199.
+        body = translate_to_solr_json_dsl({
+            "query": {"match": {"message": "monkey"}},
+            "post_filter": {"term": {"cloud.region": "us-east-1"}},
+        })
+        self.assertTrue(any("{!tag=postfilter}" in f for f in body["filter"]))
+        self.assertTrue(any("cloud_region" in f for f in body["filter"]))
+
+    def test_the_facets_exclude_the_post_filter(self):
+        # A post_filter narrows the hits *after* the aggregations: facets computed over the narrowed
+        # set are the one thing a post_filter exists to prevent. Measured against both engines, the
+        # five buckets agree to the document only with the exclusion in place.
+        body = translate_to_solr_json_dsl({
+            "query": {"match": {"message": "monkey"}},
+            "post_filter": {"term": {"cloud.region": "us-east-1"}},
+            "aggs": {"by_region": {"terms": {"field": "cloud.region", "size": 5}}},
+        })
+        self.assertEqual("postfilter", body["facet"]["by_region"]["domain"]["excludeTags"])
+
+    def test_a_body_with_no_post_filter_gets_no_exclusion(self):
+        body = translate_to_solr_json_dsl({
+            "query": {"match": {"message": "monkey"}},
+            "aggs": {"by_region": {"terms": {"field": "cloud.region", "size": 5}}},
+        })
+        self.assertNotIn("domain", body["facet"]["by_region"])
