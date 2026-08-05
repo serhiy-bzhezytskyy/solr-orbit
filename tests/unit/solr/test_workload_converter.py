@@ -1006,3 +1006,127 @@ class TestRawSearchAndDroppedAggregations(unittest.TestCase):
         body = translate_to_solr_json_dsl(
             {"aggregations": {"u": {"cardinality": {"field": "UserID"}}}})
         self.assertEqual("unique(UserID)", body["facet"]["u"])
+
+
+class TestRangeAndEmptyTerm(unittest.TestCase):
+    """
+    Two query spellings OpenSearch's own query builder serialises, both mistranslated.
+
+    Found by sending the ported bodies to a live Solr rather than by reading them: one produced a query
+    matching the whole corpus, the other a syntax error for 18 operations.
+    """
+
+    def test_a_from_to_range_keeps_its_bounds(self):
+        # Reading only gte/lte lost both and left field:[* TO *], which matches every document that has
+        # the field: clickbench's q44 reported 1,498,137 where the query selects 663.
+        body = translate_to_solr_json_dsl({"query": {"range": {
+            "RegionID": {"from": 200, "to": 300, "include_lower": True, "include_upper": True}}}})
+        self.assertEqual("RegionID:[200 TO 300]", body["query"])
+
+    def test_an_exclusive_from_to_range_uses_braces(self):
+        body = translate_to_solr_json_dsl({"query": {"range": {
+            "A": {"from": 1, "to": 9, "include_lower": False, "include_upper": False}}}})
+        self.assertEqual("A:{1 TO 9}", body["query"])
+
+    def test_gt_and_lt_are_exclusive_too(self):
+        # Rendering them as an inclusive range widened it by one value at each end.
+        body = translate_to_solr_json_dsl({"query": {"range": {"A": {"gt": 1, "lt": 9}}}})
+        self.assertEqual("A:{1 TO 9}", body["query"])
+
+    def test_gte_and_lte_stay_inclusive(self):
+        body = translate_to_solr_json_dsl({"query": {"range": {"A": {"gte": 1, "lte": 9}}}})
+        self.assertEqual("A:[1 TO 9]", body["query"])
+
+    def test_a_half_open_range_keeps_its_one_bound(self):
+        body = translate_to_solr_json_dsl({"query": {"range": {"A": {"from": 5}}}})
+        self.assertEqual("A:[5 TO *]", body["query"])
+
+    def test_an_empty_term_becomes_a_query_that_selects_nothing(self):
+        # `field:` is not a query — Solr answers 'Encountered " ")"' — and the generated configset removes
+        # blank values before indexing, mirroring OpenSearch, so no document has one. Measured against
+        # both engines, the whole bool query then reports 83,461 on each.
+        body = translate_to_solr_json_dsl({"query": {"bool": {
+            "must": [{"exists": {"field": "M"}}],
+            "must_not": [{"term": {"M": {"value": ""}}}]}}})
+        self.assertNotIn("M:)", body["query"])
+        self.assertIn("M:[* TO *]", body["query"])
+
+    def test_a_non_empty_term_is_unaffected(self):
+        body = translate_to_solr_json_dsl({"query": {"term": {"M": {"value": "x"}}}})
+        self.assertEqual("M:x", body["query"])
+
+    def test_a_metadata_value_count_counts_documents(self):
+        # clickbench counts values of _index, which every document has once. Solr has no such field and
+        # answered 'undefined field: "_index"' — a 400 for 21 operations. `count(*)` is SQL's spelling,
+        # not the JSON Facet API's, which answers a SyntaxError; countvals(id) is the same number.
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"c": {"value_count": {"field": "_index"}}}})
+        self.assertEqual("countvals(id)", body["facet"]["c"])
+
+    def test_a_value_count_over_a_real_field_is_unaffected(self):
+        body = translate_to_solr_json_dsl(
+            {"aggregations": {"c": {"value_count": {"field": "URL"}}}})
+        self.assertEqual("countvals(URL)", body["facet"]["c"])
+
+
+class TestSerialisedNumbersAndBoost(unittest.TestCase):
+    """
+    What OpenSearch's own query builder writes into a query, beyond the query itself.
+
+    Both of these came from clickbench's serialised DSL, which is what a real workload ships rather than
+    the hand-written form a test usually uses.
+    """
+
+    def test_a_whole_json_number_loses_its_fraction(self):
+        # Every number is serialised as a JSON double, so a term list over an integer field arrives as
+        # [-1.0, 6.0]. OpenSearch coerces; Solr refuses with "Invalid Number: -1.0 for field ...".
+        body = translate_to_solr_json_dsl(
+            {"query": {"terms": {"TraficSourceID": [-1.0, 6.0]}}})
+        self.assertEqual(["{!terms f=TraficSourceID}-1,6"], body["filter"])
+
+    def test_a_fractional_number_keeps_its_fraction(self):
+        # The field is then not an integer one, so truncating would change the query.
+        body = translate_to_solr_json_dsl({"query": {"term": {"A": {"value": 3.5}}}})
+        self.assertEqual("A:3.5", body["query"])
+
+    def test_a_boost_beside_the_field_does_not_eat_the_term_list(self):
+        # Dict order put `boost` first, the loop returned on it, and the whole term list was lost to *:*.
+        body = translate_to_solr_json_dsl(
+            {"query": {"terms": {"A": ["x", "y"], "boost": 1.0}}})
+        self.assertEqual(["{!terms f=A}x,y"], body["filter"])
+        self.assertEqual("*:*", body["query"])
+
+    def test_a_boolean_is_left_as_it_is(self):
+        # A bool is a subclass of int, not of float, so the coercion never sees one.
+        from solrorbit.conversion.query import _numeric_literal
+        self.assertIs(True, _numeric_literal(True))
+        self.assertEqual(1, _numeric_literal(1.0))
+
+    def test_the_fq_path_coerces_its_numbers_too(self):
+        # There are two term-list paths — the fast top-level one and the bool-clause one — and only one
+        # was fixed at first. Exercise the fq builder directly, since a body reaching either path gives
+        # the same answer and would not tell them apart.
+        from solrorbit.conversion.query import _translate_node_for_fq
+        self.assertEqual("{!terms f=T}-1,6",
+                        _translate_node_for_fq({"terms": {"T": [-1.0, 6.0]}}))
+
+    def test_the_fq_path_ignores_a_boost_beside_the_field(self):
+        from solrorbit.conversion.query import _translate_node_for_fq
+        self.assertEqual("{!terms f=A}x,y",
+                        _translate_node_for_fq({"terms": {"boost": 1.0, "A": ["x", "y"]}}))
+
+    def test_the_date_bounds_come_from_a_from_to_range_too(self):
+        # A range facet without bounds is refused outright — "Missing required parameter: 'start'" — and
+        # reading only gte/lte left them empty for every serialised query.
+        from solrorbit.conversion.query import _date_bounds_from_query
+        start, end = _date_bounds_from_query({"query": {"bool": {"filter": [
+            {"range": {"EventDate": {"from": "2013-07-01", "to": "2013-07-15"}}}]}}})
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(end)
+
+    def test_a_terms_query_inside_a_bool_filter_still_reaches_fq(self):
+        # The top-level fast path is guarded by len(query) == 1, which a serialised query with a boost
+        # fails, so the clause path has to handle it as well.
+        body = translate_to_solr_json_dsl({"query": {"bool": {"filter": [
+            {"terms": {"T": [-1.0, 6.0], "boost": 1.0}}]}}})
+        self.assertEqual(["{!terms f=T}-1,6"], body["filter"])

@@ -49,7 +49,21 @@ _BACKQUOTED = re.compile(r"`([^`]+)`")
 
 # Operators that carry no SQL equivalent on this surface. Bucketing by a date span or by a computed
 # case is the whole point of the query that uses one, so there is nothing partial to emit.
-UNTRANSLATABLE = ("span(", "case(")
+UNTRANSLATABLE = (
+    "span(",   # bucketing by a date span: Solr SQL rejects DATE_TRUNC over a date column
+    "case(",   # a computed case in a GROUP BY
+    # A string length, under any of the three spellings tried against a live node:
+    #   length(URL)      -> No match found for function signature length(<CHARACTER>)
+    #   strlen(URL)      -> No match found for function signature strlen(<CHARACTER>)
+    #   char_length(URL) -> parses, but "avg aggregation not supported for string"
+    "length(",
+)
+
+# An aggregation over a computed expression rather than a bare column. Solr SQL answers a bare "null" to
+# sum(ResolutionWidth+1) while accepting sum(ResolutionWidth), so there is no faithful statement to emit —
+# and a bare "null" is exactly the kind of failure that would otherwise be read as an empty result.
+_AGGREGATE_OF_EXPRESSION = re.compile(
+    r"\b(?:sum|avg|min|max)\(\s*[^()]*[-+*/][^()]*\)", re.IGNORECASE)
 
 # What a piped query returns when it states no `head`. Measured against a live node: `source = x |
 # fields y` answered with size=10000, total=10000.
@@ -175,6 +189,17 @@ def _translate_predicate(expression):
     # A piped query writes a timestamp as 'YYYY-MM-DD HH:MM:SS'; Solr's date field parses the ISO
     # spelling, and a space where the 'T' belongs is rejected.
     text = re.sub(r"'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})'", r"'\1T\2Z'", text)
+
+    # Solr's SQL layer runs at a conformance level that rejects `!=`: "Bang equal '!=' is not allowed
+    # under the current SQL conformance level". The standard spelling is `<>`, and both engines then
+    # report the same count.
+    text = re.sub(r"!=", "<>", text)
+
+    # A piped `like(field, pattern)` is a function call; SQL states the same test as an infix operator,
+    # and Solr answers 'Encountered "like" at line 1' to the function form.
+    text = re.sub(r"\blike\(\s*([^,()]+?)\s*,\s*('(?:[^']|'')*')\s*\)",
+                  lambda m: "%s like %s" % (m.group(1).strip(), m.group(2)), text,
+                  flags=re.IGNORECASE)
     return text
 
 
@@ -217,6 +242,17 @@ def _translate_stats(clause):
         expression = re.sub(r"^count\(\s*\)$", "count(*)", aggregation, flags=re.IGNORECASE)
         expression = re.sub(r"^dc\(\s*(.+?)\s*\)$", r"count(distinct \1)", expression,
                             flags=re.IGNORECASE)
+        # Two arithmetic properties of Solr's SQL layer, both measured against a live node, both fixed
+        # by casting the column:
+        #
+        #   avg  — an integer column is averaged with integer arithmetic. avg(ResolutionWidth) answered
+        #          1513 where the true mean is 1513.4086448702622, which is what upstream reports and
+        #          what a Solr JSON facet reports for the same field.
+        #   sum  — a total that does not fit a signed 64-bit integer comes back as Long.MAX_VALUE, with
+        #          no error: sum(UserID) answered 9223372036854775807 where the true total is 3.789e+24.
+        #          ⛔ A clamped maximum reads as a real number, which is worse than a failure.
+        expression = re.sub(r"^(avg|sum)\(\s*([^()]+?)\s*\)$",
+                            r"\1(cast(\2 as double))", expression, flags=re.IGNORECASE)
         expression = _translate_fields(expression)
         if alias is None:
             alias = "agg_%d" % (index + 1)
@@ -288,6 +324,12 @@ def translate_ppl_to_sql(query, collection=None):
     ``collection`` overrides the index named in the source clause, for a port whose collection is
     named differently from the upstream index.
     """
+    if _AGGREGATE_OF_EXPRESSION.search(query):
+        logger.info(
+            "Piped query aggregates a computed expression, which Solr SQL answers with a bare null; "
+            "leaving the operation untranslated rather than emitting a statement that returns nothing.")
+        return None
+
     for operator in UNTRANSLATABLE:
         if operator in query:
             logger.info(
@@ -307,7 +349,9 @@ def translate_ppl_to_sql(query, collection=None):
     table = collection or index
 
     where, select, group_by, order_by, limit = [], [], [], [], None
+    having = []
     aliases = {}
+    expressions = {}
     projected = []
     if leading_predicate:
         where.append(_translate_predicate(leading_predicate))
@@ -315,9 +359,30 @@ def translate_ppl_to_sql(query, collection=None):
     for stage in stages:
         verb = stage.split()[0].lower() if stage.split() else ""
         if verb == "where":
-            where.append(_translate_predicate(stage[len("where"):].strip()))
+            predicate = _translate_predicate(stage[len("where"):].strip())
+            # A `where` after a `stats` filters the *buckets*, which SQL states as HAVING: clickbench's
+            # q29 writes `stats … as c | where c > 100000`, and as a WHERE clause Solr answered "Column
+            # 'c' not found in any table" — the alias does not exist until the grouping has happened.
+            if aliases and any(re.search(r"\b%s\b" % re.escape(alias), predicate)
+                              for alias in aliases.values()):
+                # Solr will not resolve the alias in a HAVING either — "Column 'c' not found in any
+                # table" — but it accepts the aggregation expression itself, so the alias is expanded
+                # back to what it names.
+                for piped_name, alias in aliases.items():
+                    expression = expressions.get(alias)
+                    if expression:
+                        predicate = re.sub(r"\b%s\b" % re.escape(alias), expression, predicate)
+                having.append(predicate)
+            else:
+                where.append(predicate)
         elif verb == "stats":
             select, group_by, aliases = _translate_stats(stage)
+            # alias -> the aggregation expression it names, for a HAVING that cannot use the alias.
+            expressions = {}
+            for entry in select:
+                parts = re.split(r"\s+as\s+", entry, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    expressions[parts[1].strip().strip("`")] = parts[0].strip()
         elif verb == "sort":
             order_by = _translate_sort(stage, aliases)
         elif verb == "fields":
@@ -353,8 +418,23 @@ def translate_ppl_to_sql(query, collection=None):
         statement += " where %s" % " and ".join("(%s)" % w for w in where)
     if group_by:
         statement += " group by %s" % ", ".join(group_by)
+    if having:
+        statement += " having %s" % " and ".join("(%s)" % h for h in having)
     if order_by:
-        statement += " order by %s" % ", ".join(order_by)
+        # ⚠️ Solr's SQL layer will not take more sort keys than the statement has grouping keys:
+        # "If multiple sorts are specified there must be a sort for each bucket." Measured — one bucket
+        # with two sorts is refused, two buckets with two sorts is accepted, one bucket with one sort is
+        # accepted. A piped query sorts by the metric and then tie-breaks on each grouping key, which
+        # exceeds that, so the extra tie-breakers are dropped. They only order rows that are already
+        # equal on the metric, so the set of rows is the same either way; which of two tied rows comes
+        # first may differ, and a comparison should compare the set rather than that order.
+        keys = order_by
+        if group_by and len(keys) > len(group_by):
+            keys = keys[:len(group_by)]
+            logger.info(
+                "Solr SQL takes at most one sort per grouping key; dropped %d tie-breaking sort(s) "
+                "that only order rows already equal on the metric.", len(order_by) - len(keys))
+        statement += " order by %s" % ", ".join(keys)
     # Solr SQL requires a limit on an unsorted select, and a piped query without `head` is still
     # bounded upstream — measured against a live node, it returns 10,000 rows, not 10. A default of 10
     # would have under-reported such a query by three orders of magnitude.

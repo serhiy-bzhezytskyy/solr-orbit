@@ -150,11 +150,20 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
         for field, value in node["term"].items():
             v = value.get("value", value) if isinstance(value, dict) else value
             field = normalize_field_name(field)
+            if v == "":
+                # An empty term matches a document whose field is the empty string. `field:` is not a
+                # query — Solr answers 'Encountered " ")"' — and the schema-generated configset removes
+                # blank values before indexing, mirroring OpenSearch, so no document has one. The query
+                # that selects none of them is what this means.
+                return "-%s:[* TO *] AND %s:[* TO *]" % (field, field)
             return f"{field}:{_escape_solr_value(v)}"
 
     if "terms" in node:
         for field, values in node["terms"].items():
-            if field.startswith("_"):
+            # A serialised query carries `boost` beside the field, and dict order put it first: the loop
+            # returned on it and the whole term list was lost to *:*. Only a list of values is a term
+            # list, so anything else at this level is metadata.
+            if field.startswith("_") or not isinstance(values, (list, tuple)):
                 continue
             field = normalize_field_name(field)
             return _translate_terms_clause(field, values)
@@ -229,13 +238,25 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
     if "range" in node:
         for field, bounds in node["range"].items():
             field = normalize_field_name(field)
-            lo = bounds.get("gte", bounds.get("gt", "*"))
-            hi = bounds.get("lte", bounds.get("lt", "*"))
+            # `from`/`to` with `include_lower`/`include_upper` is the same range in the spelling
+            # OpenSearch's own query builder serialises. Reading only gte/lte lost both bounds and left
+            # `field:[* TO *]`, which matches every document that has the field — clickbench's q44
+            # reported 1,498,137 where the query selects 663.
+            lo = bounds.get("gte", bounds.get("gt", bounds.get("from")))
+            hi = bounds.get("lte", bounds.get("lt", bounds.get("to")))
+            lower_inclusive = "gt" not in bounds and bounds.get("include_lower", True) is not False
+            upper_inclusive = "lt" not in bounds and bounds.get("include_upper", True) is not False
+            lo = "*" if lo is None else lo
+            hi = "*" if hi is None else hi
             # Convert dates if format is specified (common for date fields)
             os_format = bounds.get("format")
             lo = _convert_date_to_solr_format(lo, os_format)
             hi = _convert_date_to_solr_format(hi, os_format)
-            return f"{field}:[{lo} TO {hi}]"
+            # An exclusive bound is a brace in Solr's range syntax, so `gt`/`lt` and
+            # include_lower/include_upper=false do not silently widen the range by one value.
+            open_bracket = "[" if lower_inclusive else "{"
+            close_bracket = "]" if upper_inclusive else "}"
+            return f"{field}:{open_bracket}{lo} TO {hi}{close_bracket}"
 
     if "exists" in node:
         field = node["exists"].get("field", "*")
@@ -334,21 +355,39 @@ def _translate_node_for_fq(node: dict) -> str:
     # terms → {!terms f=field}v1,v2,...  (Solr's efficient bitset filter)
     if "terms" in node:
         for field, values in node["terms"].items():
-            if field.startswith("_"):
+            # `boost` sits beside the field in a serialised query and is not a term list.
+            if field.startswith("_") or not isinstance(values, (list, tuple)):
                 continue
             field = normalize_field_name(field)
             if not values:
                 return None
-            # Join values as comma-separated (Solr {!terms} syntax)
-            joined = ",".join(str(v) for v in values)
+            # Join values as comma-separated (Solr {!terms} syntax). A whole JSON number is written
+            # without its fraction, as everywhere else: Solr refuses "-1.0" for an integer field.
+            joined = ",".join(str(_numeric_literal(v)) for v in values)
             return f"{{!terms f={field}}}{joined}"
 
     # range, term, exists, match etc. — translate normally
     return _translate_query_node(node, fq_list=None)
 
 
+def _numeric_literal(value):
+    """Render a JSON number the way a whole number should be written.
+
+    OpenSearch serialises every number in a query as a JSON double, so a term list over an integer
+    field arrives as ``[-1.0, 6.0]``. It coerces those to the field's type; Solr refuses — "Invalid
+    Number: -1.0 for field TraficSourceID" — so a value that is whole is written without its fraction.
+    A value that is not whole keeps it, since the field is then not an integer one.
+    """
+    # No bool guard: a bool is a subclass of int, not of float, so the float branch never sees one and a
+    # guard for it would be code no test can reach.
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _escape_solr_value(value) -> str:
     """Escape special Lucene/Solr query characters in a field value."""
+    value = _numeric_literal(value)
     special = r'+-&&||!(){}[]^"~*?:\/'
     result = []
     for char in str(value):
@@ -482,8 +521,11 @@ def _date_bounds_from_query(body: dict) -> tuple:
     for field, spec in ranges.items():
         if not isinstance(spec, dict):
             continue
-        lower = spec.get("gte") or spec.get("gt")
-        upper = spec.get("lte") or spec.get("lt")
+        # `from`/`to` is the spelling OpenSearch's own query builder serialises. Reading only gte/lte
+        # left the bounds empty, and a range facet without them is refused outright: "Missing required
+        # parameter: 'start'".
+        lower = spec.get("gte") or spec.get("gt") or spec.get("from")
+        upper = spec.get("lte") or spec.get("lt") or spec.get("to")
         if lower and upper:
             return _to_solr_date(lower), _to_solr_date(upper)
     return None, None
@@ -742,7 +784,18 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
             return f"{metric_type}({field})"
 
     if "value_count" in agg_def:
-        field = normalize_field_name(agg_def["value_count"].get("field", ""))
+        raw_field = agg_def["value_count"].get("field", "")
+        # A value_count over a *metadata* field is counting documents, not values: clickbench writes
+        # value_count on _index, which every document has exactly once. Solr has no such field and
+        # answered 'undefined field: "_index"' — a 400 for 21 operations — so it becomes the document
+        # count it means.
+        if str(raw_field).startswith("_"):
+            # `count(*)` is SQL's spelling, not the JSON Facet API's — it answers
+            # "SyntaxError: Expected ')' at position 6 in 'count(*)'". Counting the values of the unique
+            # key is the same number, since every document has exactly one: measured 1,498,137 against a
+            # corpus of 1,498,137.
+            return "countvals(id)"
+        field = normalize_field_name(raw_field)
         if not field:
             logger.warning("value_count agg '%s' has no field — skipping", agg_name)
             return None

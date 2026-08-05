@@ -96,7 +96,7 @@ class TestPipedQueryTranslation:
         # `fields a, b` names the columns to return.
         statement = translate_ppl_to_sql(
             "source = cb | where SearchPhrase != '' | fields SearchPhrase | head 10")
-        assert statement == ("select SearchPhrase from cb where (SearchPhrase != '') limit 10")
+        assert statement == ("select SearchPhrase from cb where (SearchPhrase <> '') limit 10")
 
     def test_a_projection_also_selects_what_the_sort_needs(self):
         # Solr SQL answers "Column 'EventTime' not found in any table" for an ORDER BY over a column
@@ -130,6 +130,85 @@ class TestPipedQueryTranslation:
             "source = big5 | stats {% if v %}bucket_nullable = false {% endif %}dc(`agent.name`)")
         assert "count(distinct agent_name)" in statement
         assert "bucket_nullable" not in statement
+
+    def test_bang_equal_becomes_the_standard_spelling(self):
+        # Solr's SQL layer runs at a conformance level that rejects it: "Bang equal '!=' is not allowed
+        # under the current SQL conformance level".
+        statement = translate_ppl_to_sql("source = cb | where AdvEngineID != 0 | stats count()")
+        assert "AdvEngineID <> 0" in statement
+        assert "!=" not in statement
+
+    def test_a_like_function_becomes_the_infix_operator(self):
+        # Solr answers 'Encountered "like" at line 1' to the function form.
+        statement = translate_ppl_to_sql("source = cb | where like(URL, '%google%') | head 10")
+        assert "URL like '%google%'" in statement
+
+    def test_a_predicate_over_an_aggregate_becomes_having(self):
+        # A `where` after a `stats` filters the buckets. As a WHERE clause Solr answered "Column 'c' not
+        # found in any table" — the alias does not exist until the grouping has happened.
+        statement = translate_ppl_to_sql(
+            "source = cb | stats count() as c by CounterID | where c > 100000 | sort - c | head 25")
+        assert " having " in statement
+        assert statement.index(" group by ") < statement.index(" having ")
+
+    def test_a_having_names_the_expression_not_the_alias(self):
+        # Solr will not resolve the alias in a HAVING either, but accepts the aggregation itself.
+        statement = translate_ppl_to_sql(
+            "source = cb | stats count() as c by CounterID | where c > 100000")
+        assert "having (count(*) > 100000)" in statement
+
+    def test_a_predicate_over_a_plain_field_stays_in_where(self):
+        statement = translate_ppl_to_sql(
+            "source = cb | where URL != '' | stats count() as c by CounterID")
+        assert "where (URL <> '')" in statement
+        assert " having " not in statement
+
+    def test_an_averaged_integer_column_is_cast(self):
+        # Solr's SQL layer averages an integer column with integer arithmetic: avg(ResolutionWidth)
+        # answered 1513 where the true mean is 1513.4086448702622 — which is what upstream reports and
+        # what a Solr JSON facet reports for the same field.
+        statement = translate_ppl_to_sql("source = cb | stats avg(ResolutionWidth)")
+        assert "avg(cast(ResolutionWidth as double))" in statement
+
+    def test_a_sum_is_cast_too_so_it_cannot_overflow_silently(self):
+        # A total that does not fit a signed 64-bit integer comes back as Long.MAX_VALUE with no error:
+        # sum(UserID) answered 9223372036854775807 where the true total is 3.789e+24. A clamped maximum
+        # reads as a real number, which is worse than a failure.
+        statement = translate_ppl_to_sql("source = cb | stats sum(UserID)")
+        assert "sum(cast(UserID as double))" in statement
+
+    def test_a_count_is_not_cast(self):
+        statement = translate_ppl_to_sql("source = cb | stats count()")
+        assert "count(*)" in statement
+        assert "cast" not in statement
+
+    def test_no_more_sorts_than_grouping_keys(self):
+        # "If multiple sorts are specified there must be a sort for each bucket." Measured: one bucket
+        # with two sorts is refused, two buckets with two sorts is accepted. A piped query sorts by the
+        # metric then tie-breaks on every grouping key, which exceeds that.
+        one = translate_ppl_to_sql(
+            "source = cb | stats count() as PageViews by URL | sort - PageViews, URL | head 10")
+        assert one.endswith("order by PageViews desc limit 10")
+        two = translate_ppl_to_sql(
+            "source = cb | stats count() as PageViews by URLHash, EventDate "
+            "| sort - PageViews, URLHash, EventDate | head 10")
+        assert two.endswith("order by PageViews desc, URLHash asc limit 10")
+
+    def test_a_query_that_does_not_group_keeps_every_sort(self):
+        statement = translate_ppl_to_sql("source = cb | sort - EventTime, SearchPhrase | head 10")
+        assert statement.endswith("order by EventTime desc, SearchPhrase asc limit 10")
+
+    def test_a_string_length_has_no_sql_spelling(self):
+        # Three spellings tried against a live node: length() and strlen() are unknown functions, and
+        # char_length() parses but "avg aggregation not supported for string".
+        assert translate_ppl_to_sql(
+            "source = cb | stats avg(length(URL)) as l by CounterID") is None
+
+    def test_an_aggregate_over_a_computed_expression_has_no_sql_spelling(self):
+        # Solr SQL answers a bare "null" to sum(ResolutionWidth+1) while accepting sum(ResolutionWidth).
+        # A bare null is exactly the failure that reads as an empty result.
+        assert translate_ppl_to_sql("source = cb | stats sum(ResolutionWidth+1)") is None
+        assert translate_ppl_to_sql("source = cb | stats sum(ResolutionWidth)") is not None
 
     def test_a_date_span_has_no_sql_spelling(self):
         # Solr SQL rejects DATE_TRUNC over a date column, so there is nothing faithful to emit.
