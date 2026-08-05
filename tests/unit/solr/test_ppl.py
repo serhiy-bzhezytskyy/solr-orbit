@@ -92,6 +92,28 @@ class TestPipedQueryTranslation:
         assert translate_ppl_to_sql("source = big5 | head 3", collection="c1") == \
             "select id from c1 limit 3"
 
+    def test_a_projection_becomes_the_select_list(self):
+        # `fields a, b` names the columns to return.
+        statement = translate_ppl_to_sql(
+            "source = cb | where SearchPhrase != '' | fields SearchPhrase | head 10")
+        assert statement == ("select SearchPhrase from cb where (SearchPhrase != '') limit 10")
+
+    def test_a_projection_also_selects_what_the_sort_needs(self):
+        # Solr SQL answers "Column 'EventTime' not found in any table" for an ORDER BY over a column
+        # the SELECT list omits, where the piped form sorts on a field it does not return.
+        statement = translate_ppl_to_sql(
+            "source = cb | sort EventTime | fields SearchPhrase | head 10")
+        assert statement == "select SearchPhrase, EventTime from cb order by EventTime asc limit 10"
+
+    def test_a_query_without_head_uses_the_measured_piped_page_size(self):
+        # Measured against a live node: `source = x | fields y` answers with size=10000, total=10000.
+        # A default of 10 under-reported such a query by three orders of magnitude.
+        statement = translate_ppl_to_sql("source = cb | fields UserID")
+        assert statement.endswith("limit 10000")
+
+    def test_an_explicit_head_is_not_overridden_by_the_default(self):
+        assert translate_ppl_to_sql("source = cb | head 25").endswith("limit 25")
+
     def test_a_stats_option_is_dropped_rather_than_selected(self):
         # Upstream writes `stats {% if … %}bucket_nullable = false {% endif %}count()`. The option is a
         # directive to the piped engine about empty buckets, not a value: left in place it glued itself

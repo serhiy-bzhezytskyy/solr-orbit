@@ -114,7 +114,43 @@ OPENSEARCH_TO_SOLR_TYPES = {
 }
 
 
-def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], list[tuple[str, str]]]:
+# How an OpenSearch date format name or pattern is spelt for Solr's date parser, which takes
+# java.time patterns. The named ones OpenSearch resolves internally; the rest are already patterns.
+_NAMED_DATE_FORMATS = {
+    "strict_date_optional_time": None,   # ISO8601, which Solr parses natively
+    "date_optional_time": None,
+    "epoch_millis": None,                # a number, not a string: handled by the field type
+    "epoch_second": None,
+    "basic_date": "yyyyMMdd",
+    "basic_date_time": "yyyyMMdd'T'HHmmss.SSSXX",
+    "date": "yyyy-MM-dd",
+    "date_hour_minute_second": "yyyy-MM-dd'T'HH:mm:ss",
+    "date_time": "yyyy-MM-dd'T'HH:mm:ss.SSSXX",
+    "date_time_no_millis": "yyyy-MM-dd'T'HH:mm:ssXX",
+}
+
+
+def _solr_date_patterns(os_format: str) -> list:
+    """Return the java.time patterns Solr needs to parse *os_format*.
+
+    An OpenSearch format is a ``||``-separated list of names and patterns. A name Solr already parses
+    natively contributes nothing; anything else is passed through as a pattern.
+    """
+    patterns = []
+    for part in str(os_format).split("||"):
+        part = part.strip()
+        if not part:
+            continue
+        if part in _NAMED_DATE_FORMATS:
+            mapped = _NAMED_DATE_FORMATS[part]
+            if mapped:
+                patterns.append(mapped)
+            continue
+        patterns.append(part)
+    return patterns
+
+
+def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], list[tuple[str, str]], list]:
     """
     Translate OpenSearch field mappings to Solr field definitions.
 
@@ -131,6 +167,8 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
     """
     solr_fields = {}
     copy_fields = []
+    # Every non-ISO date pattern the mapping states, so the caller can build a parse chain for them.
+    date_formats = set()
 
     for field_name, field_config in properties.items():
         os_type = field_config.get("type")
@@ -157,7 +195,9 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
             continue
 
         if os_type in (None, "object", "nested") and isinstance(field_config.get("properties"), dict):
-            nested_fields, nested_copies = translate_opensearch_mapping(field_config["properties"])
+            nested_fields, nested_copies, nested_dates = translate_opensearch_mapping(
+                field_config["properties"])
+            date_formats.update(nested_dates)
             prefix = str(field_name).replace(".", "_")
             for nested_name, nested_def in nested_fields.items():
                 solr_fields["%s_%s" % (prefix, nested_name)] = nested_def
@@ -211,10 +251,12 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
             # Solr: Uses ISO8601 by default, custom formats need DatePointField config
             os_format = field_config.get("format")
             if os_format and os_format != "strict_date_optional_time||epoch_millis":
-                logger.warning(
-                    f"Field '{field_name}' has custom date format '{os_format}'. "
-                    f"Solr will use ISO8601 format. Manual schema adjustment may be needed."
-                )
+                # Warning alone was not enough: Solr's date field parses ISO8601 only and rejects the
+                # document outright — "Invalid Date String:'2013-07-15 05:00:00'" — so a corpus stating
+                # any other format could not be indexed at all. clickbench declares four such fields
+                # across 99,997,497 documents, which is every document refused. The formats are
+                # collected here and become a parse chain in solrconfig.
+                date_formats.update(_solr_date_patterns(os_format))
 
         solr_fields[field_name] = solr_field
 
@@ -254,7 +296,7 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
                 f"{solr_sub_field_name} (type: {sub_solr_type})"
             )
 
-    return solr_fields, copy_fields
+    return solr_fields, copy_fields, sorted(date_formats)
 
 
 def generate_schema_xml(field_defs: Dict[str, Dict[str, Any]],

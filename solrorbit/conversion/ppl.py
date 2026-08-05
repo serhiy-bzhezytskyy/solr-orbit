@@ -51,6 +51,10 @@ _BACKQUOTED = re.compile(r"`([^`]+)`")
 # case is the whole point of the query that uses one, so there is nothing partial to emit.
 UNTRANSLATABLE = ("span(", "case(")
 
+# What a piped query returns when it states no `head`. Measured against a live node: `source = x |
+# fields y` answered with size=10000, total=10000.
+_PIPED_DEFAULT_ROWS = 10000
+
 # An option a stats stage may carry before its aggregations, optionally wrapped in a masked Jinja
 # conditional. `\x00J\d+\x00` is the mask the Jinja pass leaves behind.
 _STATS_OPTION = re.compile(
@@ -304,6 +308,7 @@ def translate_ppl_to_sql(query, collection=None):
 
     where, select, group_by, order_by, limit = [], [], [], [], None
     aliases = {}
+    projected = []
     if leading_predicate:
         where.append(_translate_predicate(leading_predicate))
 
@@ -315,6 +320,12 @@ def translate_ppl_to_sql(query, collection=None):
             select, group_by, aliases = _translate_stats(stage)
         elif verb == "sort":
             order_by = _translate_sort(stage, aliases)
+        elif verb == "fields":
+            # A projection: `fields a, b` names the columns to return, which is the SELECT list. It may
+            # appear before or after a sort, and a later stage still refers to the sort key, so the
+            # projection is recorded rather than applied immediately.
+            projected = [_translate_fields(f.strip())
+                         for f in _split_top_level(stage[len("fields"):].strip()) if f.strip()]
         elif verb == "head":
             rest = stage[len("head"):].strip()
             limit = int(rest) if rest.isdigit() else None
@@ -327,6 +338,13 @@ def translate_ppl_to_sql(query, collection=None):
     # has no `select *`.
     if select:
         projection = ", ".join(group_by + select)
+    elif projected:
+        # A statement that projects and sorts must select what it sorts by: Solr SQL answers "Column
+        # 'EventTime' not found in any table" for an ORDER BY over a column the SELECT list omits,
+        # where the piped form sorts on a field it does not return.
+        sorted_columns = [key.rsplit(" ", 1)[0] for key in order_by]
+        extra = [c for c in sorted_columns if c not in projected]
+        projection = ", ".join(projected + extra)
     else:
         projection = "id"
 
@@ -337,7 +355,8 @@ def translate_ppl_to_sql(query, collection=None):
         statement += " group by %s" % ", ".join(group_by)
     if order_by:
         statement += " order by %s" % ", ".join(order_by)
-    # Solr SQL requires a limit on an unsorted select; a piped query without `head` still returns a
-    # bounded page upstream, so the default matches the piped default rather than being unbounded.
-    statement += " limit %d" % (limit if limit is not None else 10)
+    # Solr SQL requires a limit on an unsorted select, and a piped query without `head` is still
+    # bounded upstream — measured against a live node, it returns 10,000 rows, not 10. A default of 10
+    # would have under-reported such a query by three orders of magnitude.
+    statement += " limit %d" % (limit if limit is not None else _PIPED_DEFAULT_ROWS)
     return _unmask_jinja(statement, masked)

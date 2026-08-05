@@ -35,18 +35,18 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
     """
 
     def test_a_geo_point_uses_the_spatial_field_type(self):
-        fields, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
+        fields, _, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
         self.assertEqual("location_rpt", fields["location"]["type"])
 
     def test_a_spatial_field_gets_no_doc_values(self):
         # An RPT field cannot expose them, which is why geonames and noaa carry lat/lon separately.
-        fields, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
+        fields, _, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
         self.assertNotIn("docValues", fields["location"])
 
     def test_numeric_date_and_boolean_get_doc_values(self):
         # OpenSearch defaults doc_values to true for all three — NumberFieldMapper, DateFieldMapper
         # and BooleanFieldMapper all declare docValuesParam(…, true).
-        fields, _ = translate_opensearch_mapping({
+        fields, _, _ = translate_opensearch_mapping({
             "n": {"type": "integer"}, "f": {"type": "float"},
             "d": {"type": "date"}, "b": {"type": "boolean"}, "k": {"type": "keyword"},
         })
@@ -57,7 +57,7 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
         # ⚠️ Not merely absent: the generated string fieldType declares docValues="true", so a field
         # that omits the attribute inherits it. Silence would give doc values to the one field
         # upstream switches them off for.
-        fields, _ = translate_opensearch_mapping({"m": {"type": "keyword", "doc_values": False}})
+        fields, _, _ = translate_opensearch_mapping({"m": {"type": "keyword", "doc_values": False}})
         self.assertIs(False, fields["m"]["docValues"])
 
     def test_match_only_text_is_analysed_text(self):
@@ -65,7 +65,7 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
         # still analysed. Absent from the type table it fell through to string, and big5's message
         # field then held each log line as one term: message:monkey matched nothing where upstream
         # found 103,349 documents.
-        fields, _ = translate_opensearch_mapping({"message": {"type": "match_only_text"}})
+        fields, _, _ = translate_opensearch_mapping({"message": {"type": "match_only_text"}})
         self.assertEqual("text_general", fields["message"]["type"])
 
     def test_the_types_the_ported_workloads_use_are_all_known(self):
@@ -75,24 +75,24 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
                                   ("ip", "string"), ("double_range", "pdouble"),
                                   ("geo_point", "location_rpt"), ("scaled_float", "pdouble"),
                                   ("half_float", "pfloat")):
-            fields, _ = translate_opensearch_mapping({"f": {"type": os_type}})
+            fields, _, _ = translate_opensearch_mapping({"f": {"type": os_type}})
             self.assertEqual(expected, fields["f"]["type"], msg="%s mapped wrongly" % os_type)
 
     def test_an_unindexed_field_is_declared_unindexed(self):
         # http_logs maps message as a keyword with index false: it is the raw log line the grok
         # pipeline reads, stored and returned but never searched.
-        fields, _ = translate_opensearch_mapping({"message": {"type": "keyword", "index": False}})
+        fields, _, _ = translate_opensearch_mapping({"message": {"type": "keyword", "index": False}})
         self.assertFalse(fields["message"]["indexed"])
         self.assertTrue(fields["message"]["stored"])
 
     def test_a_text_field_gets_no_doc_values(self):
         # A text field has none, and asking for them is an error.
-        fields, _ = translate_opensearch_mapping({"body": {"type": "text"}})
+        fields, _, _ = translate_opensearch_mapping({"body": {"type": "text"}})
         self.assertNotIn("docValues", fields["body"])
 
     def test_binary_gets_doc_values_switched_off(self):
         # BinaryFieldMapper is the one that declares docValuesParam(…, false).
-        fields, _ = translate_opensearch_mapping({"blob": {"type": "binary"}})
+        fields, _, _ = translate_opensearch_mapping({"blob": {"type": "binary"}})
         self.assertIs(False, fields["blob"]["docValues"])
 
 
@@ -106,7 +106,7 @@ class TestNestedObjectMappings(unittest.TestCase):
     """
 
     def test_an_object_contributes_its_leaves(self):
-        fields, _ = translate_opensearch_mapping({
+        fields, _, _ = translate_opensearch_mapping({
             "agent": {"type": "object", "properties": {
                 "id": {"type": "keyword"},
                 "name": {"type": "keyword"},
@@ -118,7 +118,7 @@ class TestNestedObjectMappings(unittest.TestCase):
 
     def test_nesting_goes_all_the_way_down(self):
         # big5 nests two levels: aws -> cloudwatch -> log_stream.
-        fields, _ = translate_opensearch_mapping({
+        fields, _, _ = translate_opensearch_mapping({
             "aws": {"type": "object", "properties": {
                 "cloudwatch": {"type": "object", "properties": {
                     "log_stream": {"type": "keyword"},
@@ -129,7 +129,7 @@ class TestNestedObjectMappings(unittest.TestCase):
 
     def test_an_object_with_no_type_is_still_an_object(self):
         # Some mappings omit the type and give only properties.
-        fields, _ = translate_opensearch_mapping({
+        fields, _, _ = translate_opensearch_mapping({
             "metrics": {"properties": {"size": {"type": "integer"}}},
         })
         self.assertIn("metrics_size", fields)
@@ -137,7 +137,7 @@ class TestNestedObjectMappings(unittest.TestCase):
     def test_an_open_object_becomes_a_dynamic_field(self):
         # `"host": {"type": "object"}` accepts any sub-field upstream; Solr needs a declaration, and
         # big5's documents carry host.name, which an operation collapses on.
-        fields, _ = translate_opensearch_mapping({"host": {"type": "object"}})
+        fields, _, _ = translate_opensearch_mapping({"host": {"type": "object"}})
         self.assertIn("host_*", fields)
         self.assertTrue(fields["host_*"].get("dynamic"))
 
@@ -163,7 +163,7 @@ class TestTranslateOpenSearchMapping(unittest.TestCase):
             "price": {"type": "double"},
         }
 
-        field_defs, copy_fields = translate_opensearch_mapping(properties)
+        field_defs, copy_fields, _ = translate_opensearch_mapping(properties)
 
         # Check field definitions
         self.assertEqual("text_general", field_defs["title"]["type"])
@@ -179,7 +179,7 @@ class TestTranslateOpenSearchMapping(unittest.TestCase):
             "country_code": {"type": "keyword"},
         }
 
-        field_defs, _copy_fields = translate_opensearch_mapping(properties)
+        field_defs, _copy_fields, _ = translate_opensearch_mapping(properties)
 
         self.assertEqual("string", field_defs["country_code"]["type"])
         self.assertTrue(field_defs["country_code"]["docValues"])
@@ -195,7 +195,7 @@ class TestTranslateOpenSearchMapping(unittest.TestCase):
             }
         }
 
-        field_defs, copy_fields = translate_opensearch_mapping(properties)
+        field_defs, copy_fields, _ = translate_opensearch_mapping(properties)
 
         # Main field should be text_general
         self.assertEqual("text_general", field_defs["country_code"]["type"])
@@ -220,7 +220,7 @@ class TestTranslateOpenSearchMapping(unittest.TestCase):
             }
         }
 
-        field_defs, copy_fields = translate_opensearch_mapping(properties)
+        field_defs, copy_fields, _ = translate_opensearch_mapping(properties)
 
         # Sub-field should be created
         self.assertIn("name_keyword", field_defs)
@@ -243,7 +243,7 @@ class TestTranslateOpenSearchMapping(unittest.TestCase):
             }
         }
 
-        field_defs, copy_fields = translate_opensearch_mapping(properties)
+        field_defs, copy_fields, _ = translate_opensearch_mapping(properties)
 
         # Main field
         self.assertEqual("text_general", field_defs["title"]["type"])
@@ -326,3 +326,72 @@ class TestGenerateSchemaXML(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNonIsoDateFormats(unittest.TestCase):
+    """
+    A corpus may state a date format Solr's date field does not parse.
+
+    Warning about it was not enough: Solr rejects the document outright with
+    "Invalid Date String:'2013-07-15 05:00:00'", so clickbench's four such fields would have refused
+    all 99,997,497 documents. The formats become a parse chain, verified against a live node: the
+    document is accepted and stored as 2013-07-15T05:00:00Z, and a date range finds it.
+    """
+
+    def test_a_space_separated_pattern_is_collected(self):
+        _, _, formats = translate_opensearch_mapping({
+            "EventTime": {"type": "date",
+                          "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_millis"},
+        })
+        self.assertEqual(["yyyy-MM-dd HH:mm:ss"], formats)
+
+    def test_iso_and_epoch_contribute_nothing(self):
+        # Solr parses ISO8601 natively, and an epoch number is handled by the field type.
+        _, _, formats = translate_opensearch_mapping({
+            "t": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+        })
+        self.assertEqual([], formats)
+
+    def test_a_date_field_with_no_format_contributes_nothing(self):
+        _, _, formats = translate_opensearch_mapping({"t": {"type": "date"}})
+        self.assertEqual([], formats)
+
+    def test_a_named_format_is_translated_to_its_pattern(self):
+        _, _, formats = translate_opensearch_mapping({"t": {"type": "date", "format": "basic_date"}})
+        self.assertEqual(["yyyyMMdd"], formats)
+
+    def test_several_fields_contribute_one_pattern_each_without_duplicates(self):
+        _, _, formats = translate_opensearch_mapping({
+            "a": {"type": "date", "format": "yyyy-MM-dd HH:mm:ss||epoch_millis"},
+            "b": {"type": "date", "format": "yyyy-MM-dd HH:mm:ss"},
+            "c": {"type": "date", "format": "yyyy/MM/dd"},
+        })
+        self.assertEqual(["yyyy-MM-dd HH:mm:ss", "yyyy/MM/dd"], formats)
+
+    def test_a_nested_object_contributes_its_date_pattern(self):
+        _, _, formats = translate_opensearch_mapping({
+            "outer": {"type": "object", "properties": {
+                "when": {"type": "date", "format": "yyyy-MM-dd HH:mm:ss"}}},
+        })
+        self.assertEqual(["yyyy-MM-dd HH:mm:ss"], formats)
+
+    def test_the_parse_processor_appears_only_when_a_pattern_needs_it(self):
+        from solrorbit.conversion.workload_converter import _minimal_solrconfig
+        self.assertNotIn("ParseDateFieldUpdateProcessorFactory", _minimal_solrconfig())
+        with_chain = _minimal_solrconfig(["yyyy-MM-dd HH:mm:ss"])
+        self.assertIn("ParseDateFieldUpdateProcessorFactory", with_chain)
+        self.assertIn("<str>yyyy-MM-dd HH:mm:ss</str>", with_chain)
+
+    def test_the_parse_processor_runs_before_the_update_is_applied(self):
+        from solrorbit.conversion.workload_converter import _minimal_solrconfig
+        config = _minimal_solrconfig(["yyyy-MM-dd HH:mm:ss"])
+        self.assertLess(config.index("ParseDateFieldUpdateProcessorFactory"),
+                        config.index("RunUpdateProcessorFactory"))
+
+    def test_a_property_placeholder_survives_the_template_formatting(self):
+        # The template is percent-formatted to splice the chain in; an unescaped ${...} or % would be
+        # eaten, leaving a solrconfig Solr cannot load.
+        from solrorbit.conversion.workload_converter import _minimal_solrconfig
+        for config in (_minimal_solrconfig(), _minimal_solrconfig(["yyyy-MM-dd HH:mm:ss"])):
+            self.assertIn("${solr.data.dir:}", config)
+            self.assertIn("${solr.autoCommit.maxTime:15000}", config)

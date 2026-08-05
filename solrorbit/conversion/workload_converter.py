@@ -834,7 +834,7 @@ def _generate_configset(collection_name: str, properties: dict, output_dir: str)
     configset_dir = os.path.join(output_dir, "configsets", collection_name)
     os.makedirs(configset_dir, exist_ok=True)
 
-    field_defs, copy_fields = translate_opensearch_mapping(properties)
+    field_defs, copy_fields, date_formats = translate_opensearch_mapping(properties)
     schema_xml = generate_schema_xml(field_defs, copy_fields=copy_fields, unique_key="id")
 
     # Write schema.xml
@@ -842,7 +842,7 @@ def _generate_configset(collection_name: str, properties: dict, output_dir: str)
         f.write(schema_xml)
 
     # Write minimal solrconfig.xml
-    solrconfig_xml = _minimal_solrconfig()
+    solrconfig_xml = _minimal_solrconfig(date_formats)
     with open(os.path.join(configset_dir, "solrconfig.xml"), "w", encoding="utf-8") as f:
         f.write(solrconfig_xml)
 
@@ -1374,9 +1374,31 @@ Re-running `convert-workload` with `--force` will overwrite this directory.
         f.write(content)
 
 
-def _minimal_solrconfig() -> str:
-    """Return a minimal solrconfig.xml suitable for benchmark workloads."""
-    return """<?xml version="1.0" encoding="UTF-8" ?>
+def _xml_escape(text) -> str:
+    """Escape a value for XML text content."""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _minimal_solrconfig(date_formats=None) -> str:
+    """Return a minimal solrconfig.xml suitable for benchmark workloads.
+
+    *date_formats* are java.time patterns the corpus states for its date fields beyond ISO8601. Solr's
+    date field parses ISO8601 only and rejects anything else outright, so without a parse processor a
+    corpus stating `yyyy-MM-dd HH:mm:ss` cannot be indexed at all.
+    """
+    if date_formats:
+        # The processor is given every stated pattern and tries each in turn, so a field mixing
+        # spellings still parses. It runs after blanks are removed and before the update is applied.
+        patterns = "\n".join('        <str>%s</str>' % _xml_escape(p) for p in date_formats)
+        date_parser = (
+            '    <processor class="solr.ParseDateFieldUpdateProcessorFactory">\n'
+            '      <arr name="format">\n%s\n      </arr>\n'
+            '    </processor>\n' % patterns
+        )
+    else:
+        date_parser = ""
+
+    return ("""<?xml version="1.0" encoding="UTF-8" ?>
 <config>
   <luceneMatchVersion>9.0</luceneMatchVersion>
   <dataDir>${solr.data.dir:}</dataDir>
@@ -1433,12 +1455,12 @@ def _minimal_solrconfig() -> str:
   <!-- OpenSearch silently drops a value it cannot coerce: an empty string for an integer field
        leaves the document indexed with that field simply absent. Solr rejects it instead, with
        "Error adding field 'x'='' msg=For input string: \"\"", so a corpus OpenSearch accepts cannot
-       be indexed at all. In pmc that is 59.6% of documents, on a field two operations sort by.
+       be indexed at all. In pmc that is 59.6%% of documents, on a field two operations sort by.
        This chain reproduces the OpenSearch behaviour: the field ends up absent rather than the
        document rejected. -->
   <updateRequestProcessorChain name="drop-blanks" default="true">
     <processor class="solr.RemoveBlankFieldUpdateProcessorFactory" />
-    <processor class="solr.LogUpdateProcessorFactory" />
+%(date_parser)s    <processor class="solr.LogUpdateProcessorFactory" />
     <processor class="solr.RunUpdateProcessorFactory" />
   </updateRequestProcessorChain>
   <requestHandler name="/admin/ping" class="solr.PingRequestHandler">
@@ -1450,4 +1472,4 @@ def _minimal_solrconfig() -> str:
     </lst>
   </requestHandler>
 </config>
-"""
+""" % {"date_parser": date_parser})
