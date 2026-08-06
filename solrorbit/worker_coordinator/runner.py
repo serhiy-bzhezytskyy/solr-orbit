@@ -27,9 +27,9 @@
 
 import asyncio
 import contextvars
-import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -1270,9 +1270,26 @@ def _prepare_document(doc, integer_fields=None, keep_id=False):
         # the "id" a document got depended on which worker happened to prepare it. Measured: the same 5
         # documents loaded twice produced 20 documents in the collection, not 10 — 5 parents and 5
         # children per run, under different ids each time. A re-index doubled the corpus, and the second
-        # load reported success. A digest is stable across processes and runs.
-        doc["id"] = hashlib.sha1(
-            json.dumps(doc, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        # load reported success.
+        #
+        # ⛔⛔ The fix for that was a body digest, and a digest is not a unique key. A corpus may publish
+        # the same document body many times — percolator's 2,000,000 documents hold only **2,364 distinct
+        # bodies** — and every repeat overwrites the previous one. Measured live: 5 lines with 2 distinct
+        # bodies left Solr holding **2** documents while OpenSearch held **5**, and over the whole corpus
+        # a benchmark run would leave Solr with 2,364 documents against OpenSearch's 2,000,000 — 846×
+        # short, reported as a successful load.
+        #
+        # ⭐ The digest was chasing idempotence, and idempotence is **not** what upstream does. Measured:
+        # OpenSearch loading 3 id-less lines twice holds **6** documents, not 3, because it assigns each
+        # line a fresh generated id. So a re-index doubling the corpus is upstream's own behaviour for a
+        # corpus that names no ids; what has to hold is that N lines become N documents. A counter gives
+        # that, and — unlike `hash()` — it does not vary with PYTHONHASHSEED.
+        #
+        # ⚠️ The counter is per process, so two workers would collide. The pid is mixed in for the same
+        # reason `hash()`'s per-process salt was a defect here: a worker must not depend on being alone.
+        global _generated_id_counter
+        _generated_id_counter += 1
+        doc["id"] = "%s-%d" % (_GENERATED_ID_PREFIX, _generated_id_counter)
     doc = _flatten_document(doc)
     doc = _coerce_integer_fields(doc, integer_fields)
     for key, value in list(doc.items()):
@@ -1343,7 +1360,10 @@ def _mark_nested_block(doc):
 
     ``{!parent which=...}`` needs a query selecting parents, and "has no _nested_path_" is not a positive
     term query, so the parent says so itself. A child needs its own id because Solr requires one per
-    document in the block, and it is derived from the parent's so a re-index is idempotent.
+    document in the block, and it is derived from the parent's so a child stays with the parent it
+    belongs to — ⚠️ not so a re-index is idempotent, which is what this used to claim: upstream itself is
+    not idempotent for a corpus that names no ids (3 id-less lines loaded twice leave 6 documents), and
+    the digest that chased idempotence collapsed a corpus with repeated bodies.
     """
     children = doc.get("_childDocuments_")
     if not children:
@@ -1491,6 +1511,14 @@ def _flatten_document(doc, prefix="", separator="_"):
 # cannot parse, leaving the fraction to reach the field. clickbench's FlashMinor2 is declared short and
 # written with fractions, so without this the corpus cannot be indexed at all.
 _FRACTIONAL = re.compile(r"^-?\d+\.\d+$")
+
+# ⭐ The id given to a document whose corpus names none: a per-worker prefix and a counter, so N corpus
+# lines become N documents. ⛔ Neither of the two previous spellings did that — `hash()` varied per
+# process, and the body digest that replaced it collapsed repeated bodies (percolator: 2,364 distinct
+# bodies in 2,000,000 documents, so Solr would hold 2,364 against OpenSearch's 2,000,000).
+# ⚠️ The prefix carries the pid because the counter is per process and workers run concurrently.
+_GENERATED_ID_PREFIX = "gen%d" % os.getpid()
+_generated_id_counter = 0
 
 # ⭐ The field naming which nested path a child document came from. A block join needs a query that
 # selects children, and upstream's `"path": "answers"` is exactly that selector, so the child carries the

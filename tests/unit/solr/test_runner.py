@@ -391,48 +391,81 @@ class TestNestedCorpusThroughTheTranslator(unittest.TestCase):
         self.assertEqual(51.5250666, doc["location_lat"])
 
 
-class TestGeneratedIdsAreStable(unittest.TestCase):
+class TestGeneratedIdsAreUnique(unittest.TestCase):
     """
-    ⛔ A document with no id of its own gets one derived from its body, and that derivation used
-    ``hash()``, which Python salts per process. So the id depended on which worker prepared the document:
-    measured against a live node, the same 5 documents loaded twice produced 20 documents in the
-    collection rather than 10 — 5 parents and 5 children per run, each under a different id — and the
-    second load reported success. A re-index doubled the corpus silently.
+    What a generated id has to guarantee is that **N corpus lines become N documents**. Two earlier
+    spellings each failed that in a different direction:
 
-    ⚠️ A subprocess is what makes this visible. Within one process ``hash()`` is perfectly consistent, so
-    a same-process test passes against the defect and proves nothing.
+    ⛔ ``abs(hash(body))`` — ``hash()`` on a str is salted per process, so the id depended on which worker
+    prepared the document. Measured against a live node: the same 5 documents loaded twice produced 20
+    documents rather than 10, and the second load reported success.
+
+    ⛔⛔ ``sha1(body)`` — stable across processes, but a digest is not a unique key. A corpus may publish
+    the same body many times: percolator's 2,000,000 documents hold only **2,364 distinct bodies**, so
+    every repeat overwrote the previous one. Measured live: 5 lines with 2 distinct bodies left Solr
+    holding **2** documents while OpenSearch held **5**.
+
+    ⭐ The digest was chasing idempotence, which upstream does not have — OpenSearch loading 3 id-less
+    lines twice holds **6** documents, because each line gets a fresh generated id. So a counter is
+    correct and a digest is not, and this class asserts distinctness, not repeatability.
     """
 
     DOCUMENT = {"qid": "42", "title": "t", "answers": [{"user": "a", "date": "2012-01-01T00:00:00"}]}
 
     @staticmethod
-    def _ids_from_a_fresh_interpreter(document):
+    def _ids_from_a_fresh_interpreter(documents):
+        """Prepare *documents* in one fresh interpreter, returning (parent, first child) id pairs.
+
+        ⚠️ A subprocess is what makes the process-salt failure visible: within one process ``hash()`` is
+        perfectly consistent, so a same-process test passed against that defect and proved nothing. The
+        pair-per-document shape is what makes the collapse visible, since a digest only repeats when the
+        same body is prepared twice.
+        """
         script = (
             "import json, sys\n"
             "from solrorbit.worker_coordinator.runner import _prepare_document\n"
-            "doc = _prepare_document(json.loads(sys.argv[1]))\n"
-            "print(doc['id'])\n"
-            "print(doc['_childDocuments_'][0]['id'])\n")
-        out = subprocess.run([sys.executable, "-c", script, json.dumps(document)],
+            "for raw in json.loads(sys.argv[1]):\n"
+            "    doc = _prepare_document(raw)\n"
+            "    print(doc['id'], doc['_childDocuments_'][0]['id'])\n")
+        out = subprocess.run([sys.executable, "-c", script, json.dumps(documents)],
                              capture_output=True, text=True, check=True,
                              cwd=os.path.dirname(os.path.dirname(os.path.dirname(
                                  os.path.dirname(os.path.abspath(__file__))))))
-        return out.stdout.split()
+        return [line.split() for line in out.stdout.splitlines()]
 
-    def test_the_same_document_gets_the_same_id_in_a_different_process(self):
-        first = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
-        second = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
-        self.assertEqual(first, second)
+    def test_identical_bodies_still_get_different_ids(self):
+        # ⭐ The percolator case: 3 lines with one body must become 3 documents, not 1.
+        ids = [parent for parent, _ in self._ids_from_a_fresh_interpreter([self.DOCUMENT] * 3)]
+        self.assertEqual(3, len(set(ids)), "identical bodies collapsed onto %r" % ids)
 
-    def test_a_childs_id_is_derived_from_the_parents_so_it_is_stable_too(self):
-        parent, child = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
-        self.assertEqual("%s-answers-0" % parent, child)
+    def test_a_childs_id_is_derived_from_its_own_parents(self):
+        # A child's id must follow the parent it belongs to, or two parents' children collide.
+        pairs = self._ids_from_a_fresh_interpreter([self.DOCUMENT] * 2)
+        for parent, child in pairs:
+            self.assertEqual("%s-answers-0" % parent, child)
+        self.assertNotEqual(pairs[0][1], pairs[1][1])
 
     def test_two_different_documents_still_get_different_ids(self):
-        # A stable id must not be a constant one: the derivation still has to distinguish bodies.
         other = dict(self.DOCUMENT, qid="43")
-        self.assertNotEqual(self._ids_from_a_fresh_interpreter(self.DOCUMENT)[0],
-                            self._ids_from_a_fresh_interpreter(other)[0])
+        pairs = self._ids_from_a_fresh_interpreter([self.DOCUMENT, other])
+        self.assertNotEqual(pairs[0][0], pairs[1][0])
+
+    def test_an_id_does_not_vary_with_the_process_hash_seed(self):
+        # ⛔ The original defect: PYTHONHASHSEED changed the id. A counter must not.
+        script = ("import json, sys\n"
+                  "from solrorbit.worker_coordinator.runner import _prepare_document\n"
+                  "print(_prepare_document({'a': 'b'})['id'])\n")
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))))
+
+        def under_seed(seed):
+            return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                                  check=True, cwd=root,
+                                  env=dict(os.environ, PYTHONHASHSEED=seed)).stdout.strip()
+
+        # ⚠️ The pid differs between the two runs, so only the counter part is comparable — which is
+        # the part the seed used to change.
+        self.assertEqual(under_seed("0").rsplit("-", 1)[1], under_seed("12345").rsplit("-", 1)[1])
 
 
 class _RecordingBulkClient:
@@ -1024,8 +1057,9 @@ class TestCoordinatePairComponents(unittest.TestCase):
         self.assertNotIn("_nested_parent_", doc)
 
     def test_a_child_gets_an_id_derived_from_its_parent(self):
-        # Solr requires an id per document in the block, and deriving it makes a re-index idempotent
-        # rather than creating a second copy of every child.
+        # Solr requires an id per document in the block, and deriving it from the parent's keeps a child
+        # with the parent it belongs to — ⚠️ not for idempotence, which upstream does not have either
+        # (see TestGeneratedIdsAreUnique): two parents' children must not collide.
         from solrorbit.worker_coordinator.runner import _prepare_document
         doc = _prepare_document({"id": "q1", "answers": [{"user": "a"}, {"user": "b"}]})
         self.assertEqual(["q1-answers-0", "q1-answers-1"],
