@@ -96,14 +96,15 @@ class TestPipedQueryTranslation:
         # `fields a, b` names the columns to return.
         statement = translate_ppl_to_sql(
             "source = cb | where SearchPhrase != '' | fields SearchPhrase | head 10")
-        assert statement == ("select SearchPhrase from cb where (SearchPhrase <> '') limit 10")
+        assert statement == "select SearchPhrase from cb where (SearchPhrase is not null) limit 10"
 
-    def test_a_projection_also_selects_what_the_sort_needs(self):
-        # Solr SQL answers "Column 'EventTime' not found in any table" for an ORDER BY over a column
-        # the SELECT list omits, where the piped form sorts on a field it does not return.
+    def test_a_projection_returns_only_what_it_projects(self):
+        # An earlier version added the sort key to the SELECT list, believing Solr required it there. It
+        # does not — measured against a live node — and adding it changed what the operation returns: the
+        # rows carried a column upstream does not project, so the two result shapes could not be compared.
         statement = translate_ppl_to_sql(
             "source = cb | sort EventTime | fields SearchPhrase | head 10")
-        assert statement == "select SearchPhrase, EventTime from cb order by EventTime asc limit 10"
+        assert statement == "select SearchPhrase from cb order by EventTime asc limit 10"
 
     def test_a_query_without_head_uses_the_measured_piped_page_size(self):
         # Measured against a live node: `source = x | fields y` answers with size=10000, total=10000.
@@ -160,8 +161,21 @@ class TestPipedQueryTranslation:
     def test_a_predicate_over_a_plain_field_stays_in_where(self):
         statement = translate_ppl_to_sql(
             "source = cb | where URL != '' | stats count() as c by CounterID")
-        assert "where (URL <> '')" in statement
+        assert "where (URL is not null)" in statement
         assert " having " not in statement
+
+    def test_an_emptiness_test_becomes_a_presence_test(self):
+        # `field <> ''` does not exclude a document that has no such field: Solr matched all 1,498,137
+        # documents where 1,300,738 have no SearchPhrase at all and the true answer is 197,399. In a store
+        # that omits an empty value, "not empty" is "present".
+        statement = translate_ppl_to_sql("source = cb | where SearchPhrase != '' | stats count()")
+        assert "SearchPhrase is not null" in statement
+        assert "<> ''" not in statement
+
+    def test_a_non_empty_comparison_is_not_turned_into_a_presence_test(self):
+        statement = translate_ppl_to_sql("source = cb | where AdvEngineID != 0 | stats count()")
+        assert "AdvEngineID <> 0" in statement
+        assert "is not null" not in statement
 
     def test_an_averaged_integer_column_is_cast(self):
         # Solr's SQL layer averages an integer column with integer arithmetic: avg(ResolutionWidth)

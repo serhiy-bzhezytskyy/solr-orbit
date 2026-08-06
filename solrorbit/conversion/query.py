@@ -282,6 +282,11 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
             for clause in clauses:
                 sub = _translate_query_node(clause, fq_list=fq_list)
                 if sub and sub != "*:*":
+                    # ⛔ A purely negative group matches nothing in Lucene: `+(-(URL:*x*))` returned 0
+                    # where `-(URL:*x*)` beside it returned 564. A nested must_not therefore needs
+                    # something for the negation to subtract from.
+                    if sub.lstrip().startswith("-"):
+                        sub = "*:* %s" % sub
                     parts.append(f"{prefix}({sub})")
 
         def _add_to_fq(clauses):

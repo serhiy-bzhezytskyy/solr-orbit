@@ -191,9 +191,15 @@ def _translate_predicate(expression):
     text = re.sub(r"'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})'", r"'\1T\2Z'", text)
 
     # Solr's SQL layer runs at a conformance level that rejects `!=`: "Bang equal '!=' is not allowed
-    # under the current SQL conformance level". The standard spelling is `<>`, and both engines then
-    # report the same count.
+    # under the current SQL conformance level". The standard spelling is `<>`.
     text = re.sub(r"!=", "<>", text)
+
+    # ⚠️ `field <> ''` does not exclude a document that has no such field: Solr's SQL layer matched all
+    # 1,498,137 documents where 1,300,738 have no SearchPhrase at all, so the true answer is 197,399.
+    # Upstream's piped `!= ''` means "present and not empty" — the emptiness test in a store that omits
+    # an empty value is a presence test — so `is not null` is added, which reports exactly 197,399.
+    text = re.sub(r"([`\w.]+)\s*<>\s*''",
+                  lambda match: "%s is not null" % match.group(1), text)
 
     # A piped `like(field, pattern)` is a function call; SQL states the same test as an infix operator,
     # and Solr answers 'Encountered "like" at line 1' to the function form.
@@ -404,12 +410,11 @@ def translate_ppl_to_sql(query, collection=None):
     if select:
         projection = ", ".join(group_by + select)
     elif projected:
-        # A statement that projects and sorts must select what it sorts by: Solr SQL answers "Column
-        # 'EventTime' not found in any table" for an ORDER BY over a column the SELECT list omits,
-        # where the piped form sorts on a field it does not return.
-        sorted_columns = [key.rsplit(" ", 1)[0] for key in order_by]
-        extra = [c for c in sorted_columns if c not in projected]
-        projection = ", ".join(projected + extra)
+        # ⛔ An earlier version added each sort key to the SELECT list, believing Solr needed it there.
+        # Measured against a live node it does not — `select SearchPhrase … order by EventTime` is
+        # accepted — and adding it changed what the operation *returns*: the rows carried an extra column
+        # upstream does not project, so a row-by-row comparison saw two different result shapes.
+        projection = ", ".join(projected)
     else:
         projection = "id"
 

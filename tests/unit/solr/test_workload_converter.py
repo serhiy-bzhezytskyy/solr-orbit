@@ -1130,3 +1130,23 @@ class TestSerialisedNumbersAndBoost(unittest.TestCase):
         body = translate_to_solr_json_dsl({"query": {"bool": {"filter": [
             {"terms": {"T": [-1.0, 6.0], "boost": 1.0}}]}}})
         self.assertEqual(["{!terms f=T}-1,6"], body["filter"])
+
+
+class TestNestedNegativeClause(unittest.TestCase):
+    """A nested must_not with nothing positive beside it."""
+
+    def test_a_negative_only_group_gets_something_to_subtract_from(self):
+        # `+(-(URL:*x*))` matches nothing in Lucene, where `-(URL:*x*)` beside a positive clause matches
+        # 564. Measured on a live pair: the operation reported 0 hits against upstream's 128, and 564 once
+        # the group had *:* to subtract from — which is the exact count over the corpus.
+        body = translate_to_solr_json_dsl({"query": {"bool": {"must": [
+            {"wildcard": {"Title": {"wildcard": "*Google*"}}},
+            {"bool": {"must_not": [{"wildcard": {"URL": {"wildcard": "*.google.*"}}}]}}]}}})
+        self.assertEqual("+(Title:*Google*) +(*:* -(URL:*.google.*))", body["query"])
+
+    def test_a_group_with_a_positive_clause_is_left_alone(self):
+        body = translate_to_solr_json_dsl({"query": {"bool": {"must": [
+            {"bool": {"must": [{"term": {"A": {"value": "x"}}}],
+                      "must_not": [{"term": {"B": {"value": "y"}}}]}}]}}})
+        self.assertNotIn("*:* +", body["query"])
+        self.assertIn("A:x", body["query"])
