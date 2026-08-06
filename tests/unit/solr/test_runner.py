@@ -850,6 +850,24 @@ class TestCoordinatePairComponents(unittest.TestCase):
         self.assertEqual(55.0, doc["location_lat"])
         self.assertEqual(7.0, doc["location_lon"])
 
+    def test_a_wkt_point_yields_its_components_too(self):
+        # ⭐ geopointshape's corpus writes the same points as WKT: {"location": "POINT (-0.1 51.5)"}. Solr's
+        # point field accepts that spelling directly, but the components a half-plane polygon filter needs
+        # are not derived from it, so without this the polygon operation filters on fields no document has.
+        # ⚠️ WKT is "POINT (lon lat)" — longitude first.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "location": "POINT (-0.1485188 51.5250666)"})
+        self.assertEqual(51.5250666, doc["location_lat"])
+        self.assertEqual(-0.1485188, doc["location_lon"])
+        # The value itself is left as written, since Solr parses it.
+        self.assertEqual("POINT (-0.1485188 51.5250666)", doc["location"])
+
+    def test_a_string_merely_starting_with_point_is_left_alone(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "name": "POINTER"})
+        self.assertEqual("POINTER", doc["name"])
+        self.assertNotIn("name_lat", doc)
+
     def test_a_pair_that_is_not_numeric_is_left_alone(self):
         from solrorbit.worker_coordinator.runner import _prepare_document
         doc = _prepare_document({"id": "1", "tags": ["a", "b"]})

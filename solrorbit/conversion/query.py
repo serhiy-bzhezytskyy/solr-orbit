@@ -168,6 +168,39 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
             field = normalize_field_name(field)
             return _translate_terms_clause(field, values)
 
+    if "geo_shape" in node:
+        # A geo_shape query states its shape in GeoJSON. The two shapes the workloads use are an envelope,
+        # which is a bounding box, and a polygon — so it is rewritten into the query that already carries
+        # each, rather than translated a second time.
+        for field, conf in node["geo_shape"].items():
+            if field == "boost" or not isinstance(conf, dict):
+                continue
+            shape = conf.get("shape")
+            if not isinstance(shape, dict):
+                logger.warning("geo_shape on '%s' states no inline shape (an indexed-shape reference "
+                              "has no Solr equivalent here)", field)
+                return "*:*"
+            kind = str(shape.get("type", "")).lower()
+            coordinates = shape.get("coordinates")
+            if kind == "envelope" and isinstance(coordinates, list) and len(coordinates) == 2:
+                # GeoJSON's envelope is [[minLon, maxLat], [maxLon, minLat]] — the same two corners a
+                # geo_bounding_box names top_left and bottom_right.
+                return _translate_query_node(
+                    {"geo_bounding_box": {field: {"top_left": coordinates[0],
+                                                 "bottom_right": coordinates[1]}}}, fq_list=fq_list)
+            if kind == "polygon" and isinstance(coordinates, list) and coordinates:
+                # A GeoJSON polygon's first ring is its outer boundary; any further rings are holes, which
+                # a conjunction of half-planes cannot express.
+                if len(coordinates) > 1:
+                    logger.warning("geo_shape polygon on '%s' has %d holes, which a half-plane "
+                                  "conjunction cannot express", field, len(coordinates) - 1)
+                    return "*:*"
+                return _translate_query_node(
+                    {"geo_polygon": {field: {"points": coordinates[0]}}}, fq_list=fq_list)
+            logger.warning("geo_shape on '%s' states shape type '%s', which this converter does not "
+                          "carry", field, kind or "(none)")
+            return "*:*"
+
     if "geo_bounding_box" in node:
         # A range on an exact point field: measured on 2,000 points whose membership was computed
         # independently, this answers 380 against the exact 380, where the same box against an RPT index

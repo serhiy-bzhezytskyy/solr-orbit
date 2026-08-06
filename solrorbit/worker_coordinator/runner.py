@@ -1275,6 +1275,18 @@ def _prepare_document(doc, integer_fields=None):
                 # noaa's already yields these from flattening; a flat [lon, lat] pair does not.
                 doc["%s_lat" % key] = value[1]
                 doc["%s_lon" % key] = value[0]
+        elif isinstance(value, str) and value[:5].upper() == "POINT":
+            # ⭐ A corpus may write its point as WKT rather than as a pair: geopointshape's is
+            # {"location": "POINT (-0.1485188 51.5250666)"} — the same 60,844,404 points geopoint writes as
+            # [lon, lat]. Solr's point field accepts the WKT spelling directly, but the *components* a
+            # half-plane polygon filter needs are not derived from it, so without this the polygon
+            # operation filters on fields no document has and returns nothing.
+            #
+            # ⚠️ WKT is "POINT (lon lat)" — longitude first, like the array form.
+            match = _WKT_POINT.match(value)
+            if match:
+                doc["%s_lon" % key] = float(match.group(1))
+                doc["%s_lat" % key] = float(match.group(2))
         elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
             # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the zone
             # and rejects the value outright, so every document would fail.
@@ -1392,6 +1404,10 @@ def _flatten_document(doc, prefix="", separator="_"):
 # cannot parse, leaving the fraction to reach the field. clickbench's FlashMinor2 is declared short and
 # written with fractions, so without this the corpus cannot be indexed at all.
 _FRACTIONAL = re.compile(r"^-?\d+\.\d+$")
+
+# A WKT point, whose coordinates are longitude then latitude.
+_WKT_POINT = re.compile(r"^\s*POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)\s*$",
+                        re.IGNORECASE)
 
 # Solr field types with no fractional part. A field of one of these rejects "800.94".
 _INTEGRAL_TYPES = ("pint", "plong", "int", "long", "tint", "tlong", "sint", "slong")

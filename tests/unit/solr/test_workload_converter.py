@@ -1222,3 +1222,47 @@ class TestSpatialQueries(unittest.TestCase):
             "field": "location", "origin": "55.0, 7.0", "unit": "km",
             "ranges": [{"from": 200, "to": 400}]}}}})
         self.assertTrue(body["facet"]["r"]["q"].startswith("+{!geofilt"))
+
+
+class TestGeoShapeQueries(unittest.TestCase):
+    """
+    A geo_shape query states its shape in GeoJSON.
+
+    ⭐ geopointshape's corpus holds only *points* — the same 60,844,404 as geopoint's, written as WKT — so
+    its two shapes are the ones already carried: an envelope is a bounding box and a polygon is a polygon.
+    Falling through left both operations matching the whole corpus, with issues: 0 in the report.
+    """
+
+    def test_an_envelope_becomes_a_bounding_box(self):
+        # GeoJSON's envelope is [[minLon, maxLat], [maxLon, minLat]] — geo_bounding_box's two corners.
+        body = translate_to_solr_json_dsl({"query": {"geo_shape": {"location": {"shape": {
+            "type": "envelope", "coordinates": [[-0.1, 61.0], [15.0, 48.0]]}}}}})
+        self.assertEqual("location:[48,-0.1 TO 61,15]", body["query"])
+
+    def test_a_polygon_becomes_the_half_plane_conjunction(self):
+        body = translate_to_solr_json_dsl({"query": {"geo_shape": {"location": {"shape": {
+            "type": "polygon", "coordinates": [[[-0.1, 49.0], [5.0, 48.0], [15.0, 49.0],
+                                               [14.0, 60.0], [-0.1, 61.0], [-0.1, 49.0]]]}}}}})
+        self.assertEqual(5, len(body["filter"]))
+        self.assertTrue(all(c.startswith("{!frange l=0}") for c in body["filter"]))
+
+    def test_a_polygon_with_a_hole_is_refused(self):
+        # A further ring is a hole, which a conjunction of half-planes cannot express: carrying only the
+        # outer ring would match the hole as well.
+        body = translate_to_solr_json_dsl({"query": {"geo_shape": {"location": {"shape": {
+            "type": "polygon", "coordinates": [
+                [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                [[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 4.0]]]}}}}})
+        self.assertEqual("*:*", body["query"])
+        self.assertNotIn("filter", body)
+
+    def test_an_unknown_shape_type_is_refused(self):
+        body = translate_to_solr_json_dsl({"query": {"geo_shape": {"location": {"shape": {
+            "type": "linestring", "coordinates": [[0.0, 0.0], [1.0, 1.0]]}}}}})
+        self.assertEqual("*:*", body["query"])
+
+    def test_an_indexed_shape_reference_is_refused(self):
+        # A reference to a shape stored in another document has no equivalent on this surface.
+        body = translate_to_solr_json_dsl({"query": {"geo_shape": {"location": {
+            "indexed_shape": {"index": "shapes", "id": "1", "path": "geometry"}}}}})
+        self.assertEqual("*:*", body["query"])

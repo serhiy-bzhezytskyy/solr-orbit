@@ -42,6 +42,19 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
         fields, _, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
         self.assertEqual("location", fields["location"]["type"])
 
+    def test_a_geo_shape_of_points_uses_the_point_type(self):
+        # ⭐ geopointshape declares geo_shape and its corpus holds only points, written as WKT — the same
+        # 60,844,404 as geopoint's. Falling through to `string` left the field unqueryable and both of the
+        # workload's operations matching the whole corpus, with issues: 0 in the report.
+        fields, _, _ = translate_opensearch_mapping({"location": {"type": "geo_shape"}})
+        self.assertEqual("location", fields["location"]["type"])
+
+    def test_a_geo_shape_gets_the_components_and_the_rpt_copy_too(self):
+        fields, copies, _ = translate_opensearch_mapping({"location": {"type": "geo_shape"}})
+        self.assertEqual("pdouble", fields["location_lat"]["type"])
+        self.assertEqual("location_rpt", fields["location_rpt"]["type"])
+        self.assertIn(("location", "location_rpt"), copies)
+
     def test_a_geo_point_also_gets_an_rpt_copy_for_a_heatmap(self):
         # A heatmap grid facet can only read a prefix-tree field, so both are emitted. noaa reached this
         # split by hand — filtering on lat/lon, facetting on the RPT field — after an RPT filter

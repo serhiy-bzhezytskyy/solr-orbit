@@ -122,6 +122,17 @@ OPENSEARCH_TO_SOLR_TYPES = {
     # facet needs an RPT field specifically — noaa carries one — and a workload that wants both gets both
     # by declaring a second field of that type.
     "geo_point": "location",
+
+    # ⭐ A geo_shape field whose values are points is the same case: geopointshape's corpus is the *same*
+    # 60,844,404 points as geopoint's, written as WKT — {"location": "POINT (-0.1485188 51.5250666)"}.
+    # Measured against a live node, a LatLonPointSpatialField accepts that spelling directly and the point
+    # is then found by both {!geofilt} and a bounding-box range. Falling through to `string` left the field
+    # unqueryable and both of the workload's operations matching the whole corpus.
+    #
+    # ⚠️ A geo_shape holding real shapes — a polygon per document, as `geoshape` carries — would need an RPT
+    # field and, for a non-rectangular one, JTS. That case is not this one, and pretending otherwise would
+    # index shapes into a point field; it is reported instead, in translate_opensearch_mapping.
+    "geo_shape": "location",
 }
 
 
@@ -276,7 +287,7 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
 
         solr_fields[field_name] = solr_field
 
-        if os_type == "geo_point":
+        if os_type in ("geo_point", "geo_shape"):
             # ⭐ A heatmap grid facet can only read a prefix-tree field, and an RPT index answers a point
             # query approximately (measured: 41 against the exact 39 on a 200 km filter). So both are
             # emitted: the exact field under the mapping's own name, and an RPT copy for a grid facet.
