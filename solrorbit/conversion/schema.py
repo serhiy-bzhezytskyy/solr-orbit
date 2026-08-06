@@ -136,6 +136,13 @@ OPENSEARCH_TO_SOLR_TYPES = {
 }
 
 
+# The two fields a block of parent and child documents needs, named the same way the runner names them.
+# Solr's block join takes a query selecting parents and a query selecting children; neither is
+# expressible as a negation, so each document says which it is.
+_CHILD_PATH_FIELD = "_nested_path_"
+_PARENT_MARKER_FIELD = "_nested_parent_"
+
+
 # How an OpenSearch date format name or pattern is spelt for Solr's date parser, which takes
 # java.time patterns. The named ones OpenSearch resolves internally; the rest are already patterns.
 _NAMED_DATE_FORMATS = {
@@ -177,12 +184,18 @@ def _solr_date_patterns(os_format: str) -> list:
     return patterns
 
 
-def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], list[tuple[str, str]], list]:
+def translate_opensearch_mapping(properties: Dict[str, Any], multi_valued=()) -> tuple[Dict[str, Dict[str, Any]], list[tuple[str, str]], list]:
     """
     Translate OpenSearch field mappings to Solr field definitions.
 
     Args:
         properties: The "properties" dict from OpenSearch index.json mappings
+        multi_valued: Field names observed carrying a list in the corpus. ⚠️ An OpenSearch mapping
+            does not state arity — any field may hold an array, and nested's `tag` is declared
+            ``{"type": "keyword"}`` while every document writes ``["vb6", "progress-bar"]``. Solr must
+            declare it, and a field that does not answers
+            ``multiple values encountered for non multiValued field tag``, refusing the document. So
+            arity comes from the corpus, which is where it is stated.
 
     Returns:
         Tuple of (field_defs, copy_fields) where:
@@ -194,6 +207,7 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
     """
     solr_fields = {}
     copy_fields = []
+    multi_valued = set(multi_valued or ())
     # Every non-ISO date pattern the mapping states, so the caller can build a parse chain for them.
     date_formats = set()
 
@@ -226,6 +240,40 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
                 field_config["properties"])
             date_formats.update(nested_dates)
             prefix = str(field_name).replace(".", "_")
+
+            # ⭐⭐ A `nested` mapping is not an object mapping. An object's leaves belong to the document
+            # and flatten into it; a nested field's objects are indexed as separate documents, and the
+            # queries over them ask about one object at a time. Flattening it loses exactly that:
+            # measured on nested's corpus, "an answer by user U dated before D" matched a question whose
+            # only answer by U is dated after D — 1 hit where the correct answer is 0.
+            #
+            # ⇒ So a nested field becomes child documents, whose fields take the singular of the path
+            # (answers → answer_date, answer_user), matching what the runner emits.
+            if os_type == "nested":
+                singular = prefix[:-1] if prefix.endswith("s") and len(prefix) > 1 \
+                    else "%s_item" % prefix
+                for nested_name, nested_def in nested_fields.items():
+                    solr_fields["%s_%s" % (singular, nested_name)] = nested_def
+                for source, dest in nested_copies:
+                    copy_fields.append(("%s_%s" % (singular, source), "%s_%s" % (singular, dest)))
+
+                # ⭐ And the flattened copy as well, multiValued. It is not redundant: an aggregation and
+                # a `mode: max` sort over one nested leaf are expressible over it directly, and measured
+                # on the corpus a `mode: max` sort answered the same 80 documents in the same order. What
+                # it cannot answer is a query correlating two leaves of the same object, which is why the
+                # child documents are the primary representation and this is the copy.
+                for nested_name, nested_def in nested_fields.items():
+                    flat = dict(nested_def)
+                    flat["multiValued"] = True
+                    solr_fields["%s_%s" % (prefix, nested_name)] = flat
+
+                # The block markers, so `{!parent which=...}` and a childFilter have something to name.
+                solr_fields[_CHILD_PATH_FIELD] = {
+                    "type": "string", "indexed": True, "stored": True, "docValues": True}
+                solr_fields[_PARENT_MARKER_FIELD] = {
+                    "type": "boolean", "indexed": True, "stored": True}
+                continue
+
             for nested_name, nested_def in nested_fields.items():
                 solr_fields["%s_%s" % (prefix, nested_name)] = nested_def
             for source, dest in nested_copies:
@@ -284,6 +332,14 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
                 # across 99,997,497 documents, which is every document refused. The formats are
                 # collected here and become a parse chain in solrconfig.
                 date_formats.update(_solr_date_patterns(os_format))
+
+        # ⚠️ Declared only where the corpus was observed to carry a list, not everywhere. A blanket
+        # multiValued is not free: measured on a live node, Solr SQL's `avg` over a single-valued integer
+        # column answered 50 where the same values in a multiValued column answered 49.5 — the
+        # single-valued path uses integer arithmetic. Declaring every field multiValued would change what
+        # a ported operation computes.
+        if field_name in multi_valued:
+            solr_field["multiValued"] = True
 
         solr_fields[field_name] = solr_field
 
@@ -391,6 +447,14 @@ def generate_schema_xml(field_defs: Dict[str, Dict[str, Any]],
 
         if doc_values is not None:
             attrs.append(f'docValues="{str(doc_values).lower()}"')
+
+        # ⛔ Arity was observed from the corpus, translated into the field definition — and then dropped
+        # here, because this renderer wrote four attributes and read no others. The generated schema
+        # declared `tag` single-valued while every nested document writes ["vb6","progress-bar"], and
+        # Solr refused all 1,000: "multiple values encountered for non multiValued field tag". The
+        # measurement was right and never reached the file.
+        if field_config.get("multiValued"):
+            attrs.append('multiValued="true"')
 
         # A dynamic field stands in for a subtree upstream left open, so it needs the dynamicField
         # element rather than field — Solr matches the pattern against names it has no declaration for.

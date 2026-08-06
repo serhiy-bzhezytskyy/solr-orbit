@@ -27,6 +27,7 @@
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -1253,28 +1254,43 @@ def _translate_ndjson_stream(lines, integer_fields=None):
                 _logger.warning("Skipping malformed NDJSON line: %s", exc)
 
 
-def _prepare_document(doc, integer_fields=None):
+def _prepare_document(doc, integer_fields=None, keep_id=False):
     """Make one parsed corpus document ready for Solr.
 
     Flatten it, give it an id if it has none, coerce a fraction in a field declared integral, turn a
-    two-element numeric list into the ``"lat,lon"`` a spatial field takes, and give a zoneless timestamp
-    the zone Solr requires. Shared by both corpus shapes so the two cannot drift apart — they had.
+    two-element numeric list into the ``"lat,lon"`` a spatial field takes, give a zoneless timestamp the
+    zone Solr requires, and turn a list of objects into child documents. Shared by both corpus shapes so
+    the two cannot drift apart — they had, four times.
+
+    ``keep_id`` says the caller has already set the id from a bulk action line, so it must not be
+    replaced by one hashed from the body.
     """
-    if "id" not in doc:
-        doc["id"] = str(abs(hash(json.dumps(doc, sort_keys=True))))
+    if not keep_id and "id" not in doc:
+        # ⛔ This was `abs(hash(...))`, and `hash()` on a str is salted per process (PYTHONHASHSEED), so
+        # the "id" a document got depended on which worker happened to prepare it. Measured: the same 5
+        # documents loaded twice produced 20 documents in the collection, not 10 — 5 parents and 5
+        # children per run, under different ids each time. A re-index doubled the corpus, and the second
+        # load reported success. A digest is stable across processes and runs.
+        doc["id"] = hashlib.sha1(
+            json.dumps(doc, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     doc = _flatten_document(doc)
     doc = _coerce_integer_fields(doc, integer_fields)
     for key, value in list(doc.items()):
-        if isinstance(value, list) and len(value) == 2:
-            if all(isinstance(v, (int, float)) for v in value):
-                # ⚠️ [lon, lat] — GeoJSON order — becomes the "lat,lon" a Solr spatial field takes.
-                doc[key] = f"{value[1]},{value[0]}"
-                # ⭐ And the components, because a point-in-polygon filter needs them as numbers. Solr
-                # cannot take a WKT POLYGON without JTS, and a convex ring is the intersection of its
-                # edges' half-planes — which {!frange} states over lat and lon. A nested corpus like
-                # noaa's already yields these from flattening; a flat [lon, lat] pair does not.
-                doc["%s_lat" % key] = value[1]
-                doc["%s_lon" % key] = value[0]
+        # ⚠️ `len(value) == 2` alone is not "is a point": a nested field with exactly two objects
+        # yields a flattened copy of exactly two values, and this branch claimed it, did nothing —
+        # the values are not numbers — and the elif chain skipped the zoning below. Measured: a
+        # document with 1 or 3 answers had its dates zoned and one with 2 did not, so Solr refused
+        # exactly those. The numeric test belongs in the condition, not inside it.
+        if (isinstance(value, list) and len(value) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+            # ⚠️ [lon, lat] — GeoJSON order — becomes the "lat,lon" a Solr spatial field takes.
+            doc[key] = f"{value[1]},{value[0]}"
+            # ⭐ And the components, because a point-in-polygon filter needs them as numbers. Solr
+            # cannot take a WKT POLYGON without JTS, and a convex ring is the intersection of its
+            # edges' half-planes — which {!frange} states over lat and lon. A nested corpus like
+            # noaa's already yields these from flattening; a flat [lon, lat] pair does not.
+            doc["%s_lat" % key] = value[1]
+            doc["%s_lon" % key] = value[0]
         elif isinstance(value, str) and value[:5].upper() == "POINT":
             # ⭐ A corpus may write its point as WKT rather than as a pair: geopointshape's is
             # {"location": "POINT (-0.1485188 51.5250666)"} — the same 60,844,404 points geopoint writes as
@@ -1287,11 +1303,61 @@ def _prepare_document(doc, integer_fields=None):
             if match:
                 doc["%s_lon" % key] = float(match.group(1))
                 doc["%s_lat" % key] = float(match.group(2))
-        elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
-            # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the zone
-            # and rejects the value outright, so every document would fail.
-            if value[4] == '-' and value[7] == '-' and value[13] == ':' and value[16] == ':':
-                doc[key] = value.replace(' ', 'T') + 'Z'
+        elif isinstance(value, str):
+            zoned = _zone_a_bare_timestamp(value)
+            if zoned is not None:
+                doc[key] = zoned
+        elif isinstance(value, list) and any(isinstance(v, str) for v in value):
+            # ⚠️ A multi-valued field's values need the zone as much as a single value does, and this
+            # loop read only strings. The flattened copy of a nested date field is a list of them, so
+            # without this Solr answered `Invalid Date String:'2009-06-16T09:55:57.320'` and refused
+            # every parent document — the copy is written per child, never as a lone string.
+            doc[key] = [_zone_a_bare_timestamp(v) or v if isinstance(v, str) else v for v in value]
+    return _mark_nested_block(doc)
+
+
+def _zone_a_bare_timestamp(value):
+    """Give a zoneless timestamp the zone Solr requires, or return None if it is not one.
+
+    OpenSearch reads a zoneless timestamp as UTC; Solr's date field rejects it outright, so every
+    document would fail. pmc writes the space-separated form and noaa the T-separated one.
+
+    ⭐ The fraction is part of the form, not decoration: nested writes
+    ``2009-06-16T07:28:42.770`` — 23 characters — and a check for exactly 19 did not see it, so Solr
+    answered ``Invalid Date String`` for every document in that corpus.
+    """
+    if len(value) < 19 or value[10] not in (" ", "T"):
+        return None
+    if not (value[4] == "-" and value[7] == "-" and value[13] == ":" and value[16] == ":"):
+        return None
+    if len(value) > 19:
+        # Only a fractional part may follow. Anything else — a zone, an offset — means the value already
+        # states one and must be left as written.
+        if value[19] != "." or not value[20:].isdigit():
+            return None
+    return value.replace(" ", "T") + "Z"
+
+
+def _mark_nested_block(doc):
+    """Mark a parent and its children, and give each child an id.
+
+    ``{!parent which=...}`` needs a query selecting parents, and "has no _nested_path_" is not a positive
+    term query, so the parent says so itself. A child needs its own id because Solr requires one per
+    document in the block, and it is derived from the parent's so a re-index is idempotent.
+    """
+    children = doc.get("_childDocuments_")
+    if not children:
+        return doc
+    doc[_PARENT_MARKER_FIELD] = True
+    parent_id = doc.get("id")
+    for index, child in enumerate(children):
+        if "id" not in child:
+            child["id"] = "%s-%s-%d" % (parent_id, child.get(_CHILD_PATH_FIELD, "child"), index)
+        for key, value in list(child.items()):
+            if isinstance(value, str):
+                zoned = _zone_a_bare_timestamp(value)
+                if zoned is not None:
+                    child[key] = zoned
     return doc
 
 
@@ -1338,24 +1404,12 @@ def _stream_bulk_pairs(first_action_line, lines_iter, integer_fields=None):
                     target = meta.get("_index") or meta.get("_collection")
                 break
 
-        if not id_found:
-            doc["id"] = str(abs(hash(json.dumps(doc, sort_keys=True))))
-
-        doc = _flatten_document(doc)
-        doc = _coerce_integer_fields(doc, integer_fields)
-
-        for key, value in list(doc.items()):
-            if isinstance(value, list) and len(value) == 2:
-                if all(isinstance(v, (int, float)) for v in value):
-                    doc[key] = f"{value[1]},{value[0]}"
-            elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
-                # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the
-                # zone and rejects the value outright, so every document would fail. pmc writes the
-                # space-separated form and noaa the T-separated one; both mean the same instant.
-                if value[4] == '-' and value[7] == '-' and value[13] == ':' and value[16] == ':':
-                    doc[key] = value.replace(' ', 'T') + 'Z'
-
-        yield doc, target
+        # ⛔ This was a second, hand-written copy of the preparation _prepare_document does, and it had
+        # drifted from it four times — losing the lat/lon components, the WKT point form, the child
+        # documents a nested corpus needs, and the fractional-second timestamp. It calls the one
+        # implementation now, so a corpus published with bulk action lines is prepared identically to the
+        # same documents published without them.
+        yield _prepare_document(doc, integer_fields, keep_id=id_found), target
         action_line = next(lines_iter, "").strip()
 
 
@@ -1372,13 +1426,18 @@ def _flatten_document(doc, prefix="", separator="_"):
     ``"lat,lon"`` string under the parent's own name, since that is what a Solr spatial field takes.
     The components are kept as well: an RPT field cannot expose them as a ValueSource.
 
-    A list of objects is left alone. Solr's answer to that is a child document, which is a different
-    shape than flattening, and no workload ported so far has one.
+    ⭐ A list of objects becomes **child documents**, not flattened fields. Flattening it would put every
+    object's values into one multi-valued field per leaf, which loses the correlation *within* one object —
+    and that correlation is exactly what a nested query asks about. Measured on nested's corpus: a question
+    whose only answer by a given user is dated 2009-06-17 was matched by the flattened form for
+    "an answer by that user dated before 2009-06-17" (1 hit) where the correct answer is 0. A block join
+    over child documents answers 0.
     """
     if not isinstance(doc, dict):
         return doc
 
     out = {}
+    children = []
     for key, value in doc.items():
         # A key may itself contain dots. big5 writes a literal "aws.cloudwatch" key holding an object,
         # so the path is normalised the way the query side normalises a field name — every dot becomes
@@ -1391,9 +1450,37 @@ def _flatten_document(doc, prefix="", separator="_"):
             if keys == {"lat", "lon"}:
                 out[name] = "%s,%s" % (value["lat"], value["lon"])
             for sub_name, sub_value in _flatten_document(value, name, separator).items():
-                out[sub_name] = sub_value
+                if sub_name == "_childDocuments_":
+                    # A list of objects deeper in the tree: its children belong to the document being
+                    # built, since Solr's block join is one level in a bulk body.
+                    children.extend(sub_value)
+                else:
+                    out[sub_name] = sub_value
+        elif (isinstance(value, list) and value
+              and all(isinstance(v, dict) for v in value)):
+            # ⭐ A list of objects is a nested field upstream, and Solr's equivalent is a child document
+            # per object. The child's fields take the singular of the parent's name — "answers" yields
+            # answer_date and answer_user — so the parent's own flattened names stay free and a block-join
+            # query can name a child field without ambiguity.
+            singular = name[:-1] if name.endswith("s") and len(name) > 1 else "%s_item" % name
+            for item in value:
+                child = _flatten_document(item, singular, separator)
+                child[_CHILD_PATH_FIELD] = name
+                children.append(child)
+                # ⛔ And the flattened copy under the plural name, which the schema declares and this
+                # did not write. Declared-but-unwritten is worse than absent: measured on nested's
+                # 1,000-document sample, `sort=field(answers_date,max) desc` over the empty field did
+                # not error — it returned all 90 documents in id order, and the same sort with the
+                # field written returns upstream's order exactly. A silent wrong order, not a failure.
+                for leaf, leaf_value in child.items():
+                    if leaf == _CHILD_PATH_FIELD or not leaf.startswith(singular + separator):
+                        continue
+                    flat_name = "%s%s" % (name, leaf[len(singular):])
+                    out.setdefault(flat_name, []).append(leaf_value)
         else:
             out[name] = value
+    if children:
+        out["_childDocuments_"] = children
     return out
 
 
@@ -1404,6 +1491,16 @@ def _flatten_document(doc, prefix="", separator="_"):
 # cannot parse, leaving the fraction to reach the field. clickbench's FlashMinor2 is declared short and
 # written with fractions, so without this the corpus cannot be indexed at all.
 _FRACTIONAL = re.compile(r"^-?\d+\.\d+$")
+
+# ⭐ The field naming which nested path a child document came from. A block join needs a query that
+# selects children, and upstream's `"path": "answers"` is exactly that selector, so the child carries the
+# path it came from rather than a generic "is a child" flag: a document with two nested fields would
+# otherwise mix their children in one block and a query on either would match both.
+_CHILD_PATH_FIELD = "_nested_path_"
+
+# The field marking a parent, so `{!parent which=...}` has something to name. Solr needs a query
+# identifying parents, and "has no _nested_path_" is not expressible as a positive term query.
+_PARENT_MARKER_FIELD = "_nested_parent_"
 
 # A WKT point, whose coordinates are longitude then latitude.
 # ⚠️ The exponent is not optional decoration: geopointshape's corpus writes a coordinate near zero as

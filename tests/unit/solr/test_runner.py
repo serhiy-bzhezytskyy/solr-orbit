@@ -19,6 +19,9 @@
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock
 
@@ -281,10 +284,70 @@ class TestFlattenDocument(unittest.TestCase):
         doc = {"TAVG": 22.9, "id": "1"}
         self.assertEqual(doc, _flatten_document(doc))
 
-    def test_a_list_of_objects_is_left_alone(self):
-        # Solr's answer to that is a child document, a different shape than flattening.
-        doc = {"readings": [{"v": 1}, {"v": 2}]}
-        self.assertEqual(doc, _flatten_document(doc))
+    def test_a_list_of_objects_becomes_child_documents(self):
+        # ⛔ This test previously asserted the list was left alone, which made the whole nested corpus
+        # unindexable: Solr answered `undefined field: "answers.date"`.
+        #
+        # ⭐⭐ And flattening it instead is not the fix either. Flattening puts every object's values into
+        # one multi-valued field per leaf, which loses the correlation *within* one object — measured on
+        # nested's corpus, a question whose only answer by a given user is dated 2009-06-17 was matched by
+        # the flattened form for "an answer by that user dated before 2009-06-17" (1 hit) where the
+        # correct answer is 0. A block join over child documents answers 0.
+        out = _flatten_document({"readings": [{"v": 1}, {"v": 2}]})
+        self.assertNotIn("readings", out)
+        self.assertEqual([{"reading_v": 1, "_nested_path_": "readings"},
+                          {"reading_v": 2, "_nested_path_": "readings"}],
+                         out["_childDocuments_"])
+
+    def test_a_child_carries_the_nested_path_it_came_from(self):
+        # ⭐ The path is the selector a block join needs: upstream's `"path": "answers"` says which nested
+        # field to query. A generic "is a child" flag would mix two nested fields' children in one block,
+        # and a query on either would match both.
+        out = _flatten_document({"answers": [{"user": "a"}], "comments": [{"user": "b"}]})
+        paths = sorted(c["_nested_path_"] for c in out["_childDocuments_"])
+        self.assertEqual(["answers", "comments"], paths)
+
+    def test_a_child_field_takes_the_singular_of_its_path(self):
+        out = _flatten_document({"answers": [{"date": "d", "user": "u"}]})
+        child = out["_childDocuments_"][0]
+        self.assertEqual("d", child["answer_date"])
+        self.assertEqual("u", child["answer_user"])
+
+    def test_a_path_that_is_not_a_plural_still_yields_a_distinct_prefix(self):
+        # Without a suffix the child field would be named exactly like the parent's own flattened field.
+        out = _flatten_document({"data": [{"v": 1}]})
+        self.assertEqual(1, out["_childDocuments_"][0]["data_item_v"])
+
+    def test_a_list_of_objects_nested_deeper_still_yields_children_of_the_document(self):
+        # Solr's block join is one level within a bulk body, so a deeper list's objects belong to the
+        # document being built rather than to an intermediate one.
+        out = _flatten_document({"post": {"answers": [{"v": 1}]}})
+        self.assertEqual("post_answers", out["_childDocuments_"][0]["_nested_path_"])
+        self.assertEqual(1, out["_childDocuments_"][0]["post_answer_v"])
+
+    def test_a_list_of_plain_values_is_still_a_multi_valued_field(self):
+        # tag is ["vb6", "progress-bar"] — a list, but not of objects, so it stays one field.
+        self.assertEqual({"tag": ["vb6", "x"]}, _flatten_document({"tag": ["vb6", "x"]}))
+
+    def test_a_nested_field_also_yields_the_flattened_copy_the_schema_declares(self):
+        # ⛔ The schema declared answers_date beside the child field answer_date and this wrote only the
+        # children, so the declared field held nothing. Declared-but-unwritten is worse than absent:
+        # measured on the 1,000-document sample, `sort=field(answers_date,max) desc` over the empty
+        # field did not error — it returned all 90 matching documents in id order, while the same sort
+        # with the field written returns upstream's order exactly.
+        out = _flatten_document({"answers": [{"user": "u1", "date": "d1"},
+                                             {"user": "u2", "date": "d2"}]})
+        self.assertEqual(["u1", "u2"], out["answers_user"])
+        self.assertEqual(["d1", "d2"], out["answers_date"])
+        # and the children are still the primary representation
+        self.assertEqual(2, len(out["_childDocuments_"]))
+
+    def test_the_flattened_copy_is_named_for_the_path_not_the_singular(self):
+        # The child field is answer_date; the copy has to be answers_date, or a `mode: max` sort names
+        # a field that does not exist and the schema's declaration goes unused.
+        out = _flatten_document({"answers": [{"date": "d"}]})
+        self.assertIn("answers_date", out)
+        self.assertNotIn("answer_date", out)
 
 
 class TestNestedCorpusThroughTheTranslator(unittest.TestCase):
@@ -306,6 +369,70 @@ class TestNestedCorpusThroughTheTranslator(unittest.TestCase):
             lines = ['{"index": {"_id": "x"}}', json.dumps({"date": written})]
             doc, _ = next(iter(_translate_ndjson_stream(lines)))
             self.assertEqual("2016-01-01T00:00:00Z", doc["date"], msg="from %r" % written)
+
+    def test_a_multi_valued_date_field_is_zoned_at_every_arity(self):
+        # ⛔ Two is not a special number, and the code read it as one: the [lon, lat] branch tested
+        # `len(value) == 2` and only then whether the values were numbers, so a list of exactly two
+        # timestamps was claimed by that branch, left untouched, and never reached the zoning. Measured
+        # through _prepare_document: one and three answers were zoned, two were not, and Solr refused
+        # exactly those documents with `Invalid Date String`.
+        for count in (1, 2, 3):
+            answers = [{"date": "2009-06-1%dT07:28:42.770" % i} for i in range(count)]
+            lines = ['{"index": {"_id": "x"}}', json.dumps({"answers": answers})]
+            doc, _ = next(iter(_translate_ndjson_stream(lines)))
+            self.assertTrue(all(v.endswith("Z") for v in doc["answers_date"]),
+                            msg="%d answer(s): %r" % (count, doc["answers_date"]))
+
+    def test_a_two_element_numeric_list_is_still_a_point(self):
+        # The narrowing above must not cost the point form: [lon, lat] is a list of exactly two numbers.
+        lines = ['{"index": {"_id": "x"}}', json.dumps({"location": [-0.1485188, 51.5250666]})]
+        doc, _ = next(iter(_translate_ndjson_stream(lines)))
+        self.assertEqual("51.5250666,-0.1485188", doc["location"])
+        self.assertEqual(51.5250666, doc["location_lat"])
+
+
+class TestGeneratedIdsAreStable(unittest.TestCase):
+    """
+    ⛔ A document with no id of its own gets one derived from its body, and that derivation used
+    ``hash()``, which Python salts per process. So the id depended on which worker prepared the document:
+    measured against a live node, the same 5 documents loaded twice produced 20 documents in the
+    collection rather than 10 — 5 parents and 5 children per run, each under a different id — and the
+    second load reported success. A re-index doubled the corpus silently.
+
+    ⚠️ A subprocess is what makes this visible. Within one process ``hash()`` is perfectly consistent, so
+    a same-process test passes against the defect and proves nothing.
+    """
+
+    DOCUMENT = {"qid": "42", "title": "t", "answers": [{"user": "a", "date": "2012-01-01T00:00:00"}]}
+
+    @staticmethod
+    def _ids_from_a_fresh_interpreter(document):
+        script = (
+            "import json, sys\n"
+            "from solrorbit.worker_coordinator.runner import _prepare_document\n"
+            "doc = _prepare_document(json.loads(sys.argv[1]))\n"
+            "print(doc['id'])\n"
+            "print(doc['_childDocuments_'][0]['id'])\n")
+        out = subprocess.run([sys.executable, "-c", script, json.dumps(document)],
+                             capture_output=True, text=True, check=True,
+                             cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+                                 os.path.dirname(os.path.abspath(__file__))))))
+        return out.stdout.split()
+
+    def test_the_same_document_gets_the_same_id_in_a_different_process(self):
+        first = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
+        second = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
+        self.assertEqual(first, second)
+
+    def test_a_childs_id_is_derived_from_the_parents_so_it_is_stable_too(self):
+        parent, child = self._ids_from_a_fresh_interpreter(self.DOCUMENT)
+        self.assertEqual("%s-answers-0" % parent, child)
+
+    def test_two_different_documents_still_get_different_ids(self):
+        # A stable id must not be a constant one: the derivation still has to distinguish bodies.
+        other = dict(self.DOCUMENT, qid="43")
+        self.assertNotEqual(self._ids_from_a_fresh_interpreter(self.DOCUMENT)[0],
+                            self._ids_from_a_fresh_interpreter(other)[0])
 
 
 class _RecordingBulkClient:
@@ -861,6 +988,48 @@ class TestCoordinatePairComponents(unittest.TestCase):
         self.assertEqual(-0.1485188, doc["location_lon"])
         # The value itself is left as written, since Solr parses it.
         self.assertEqual("POINT (-0.1485188 51.5250666)", doc["location"])
+
+    def test_a_timestamp_with_a_fraction_and_no_zone_gets_the_zone(self):
+        # ⛔ Measured on a live node: Solr answers `Invalid Date String:'2009-06-16T07:28:42.770'`. The
+        # check was for a length of exactly 19 and nested's corpus writes 23 characters, so it saw none of
+        # them — every document in that corpus was refused.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "creationDate": "2009-06-16T07:28:42.770"})
+        self.assertEqual("2009-06-16T07:28:42.770Z", doc["creationDate"])
+
+    def test_a_timestamp_that_already_states_a_zone_is_left_alone(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        for value in ("2009-06-16T07:28:42Z", "2009-06-16T07:28:42.770Z",
+                      "2009-06-16T07:28:42+02:00"):
+            doc = _prepare_document({"id": "1", "t": value})
+            self.assertEqual(value, doc["t"], value)
+
+    def test_a_child_timestamp_gets_the_zone_too(self):
+        # ⚠️ A child document is built after the parent's own values are zoned, so without this the
+        # children keep the form Solr refuses and the whole block fails.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "answers": [{"date": "2009-06-16T09:55:57.320"}]})
+        self.assertEqual("2009-06-16T09:55:57.320Z", doc["_childDocuments_"][0]["answer_date"])
+
+    def test_a_parent_is_marked_so_a_block_join_can_name_it(self):
+        # `{!parent which=...}` needs a query selecting parents, and "has no _nested_path_" is not a
+        # positive term query.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "q1", "answers": [{"user": "a"}]})
+        self.assertTrue(doc["_nested_parent_"])
+
+    def test_a_document_with_no_children_is_not_marked_as_a_parent(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "q1", "title": "t"})
+        self.assertNotIn("_nested_parent_", doc)
+
+    def test_a_child_gets_an_id_derived_from_its_parent(self):
+        # Solr requires an id per document in the block, and deriving it makes a re-index idempotent
+        # rather than creating a second copy of every child.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "q1", "answers": [{"user": "a"}, {"user": "b"}]})
+        self.assertEqual(["q1-answers-0", "q1-answers-1"],
+                         [c["id"] for c in doc["_childDocuments_"]])
 
     def test_a_wkt_coordinate_in_exponent_form_is_read(self):
         # ⛔ Measured on the loaded corpus: 993 of geopointshape's 60,844,404 documents write a coordinate

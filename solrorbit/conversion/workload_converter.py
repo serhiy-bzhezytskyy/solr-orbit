@@ -33,6 +33,7 @@ The converter:
   - Returns a summary dict with output_dir, issues, and skipped operations
 """
 
+import bz2
 import json
 import logging
 import os
@@ -42,7 +43,7 @@ from datetime import datetime
 
 from .detector import is_opensearch_workload
 from .ppl import facet_body_for_piped_query, source_index, translate_ppl_to_sql
-from .query import translate_to_solr_json_dsl
+from .query import set_nested_fields_present, translate_to_solr_json_dsl
 
 logger = logging.getLogger(__name__)
 
@@ -531,6 +532,12 @@ def convert_opensearch_workload(source_dir: str, output_dir: str) -> dict:
     indices = rendered_workload.get("indices") or []
     _TARGET_COLLECTION = indices[0].get("name") if indices and isinstance(indices[0], dict) else None
 
+    # Whether the mapping declares a nested field, which decides whether every operation needs the
+    # filter restricting it to top-level documents. It is a property of the workload, not of any one
+    # operation: match_all has no nested clause of its own and is precisely the operation that counted
+    # the child documents too — 2,977 against upstream's 1,000 on nested's sample.
+    set_nested_fields_present(_declares_a_nested_field(rendered_workload, source_dir))
+
     _generate_configsets_from_indices(rendered_workload, source_dir, output_dir, issues)
 
     # --- Write converted workload.json (template-preserving) ---
@@ -576,6 +583,36 @@ def convert_opensearch_workload(source_dir: str, output_dir: str) -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _declares_a_nested_field(rendered_workload: dict, source_dir: str) -> bool:
+    """Say whether any of the workload's index mappings declares a field of type ``nested``."""
+    def walk(properties):
+        if not isinstance(properties, dict):
+            return False
+        for field_config in properties.values():
+            if not isinstance(field_config, dict):
+                continue
+            if field_config.get("type") == "nested":
+                return True
+            if walk(field_config.get("properties")):
+                return True
+        return False
+
+    for index in rendered_workload.get("indices", []):
+        body = index.get("body") if isinstance(index, dict) else None
+        if not body:
+            continue
+        path = os.path.join(source_dir, body)
+        if not os.path.isfile(path):
+            continue
+        try:
+            mappings = _load_workload_json(path).get("mappings", {})
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if walk(mappings.get("properties")):
+            return True
+    return False
+
+
 def _generate_configsets_from_indices(rendered_workload: dict, source_dir: str, output_dir: str, issues: list):
     """Generate Solr configsets from the rendered workload's indices section."""
     for index in rendered_workload.get("indices", []):
@@ -591,9 +628,95 @@ def _generate_configsets_from_indices(rendered_workload: dict, source_dir: str, 
             mappings = index_body.get("mappings", {})
             properties = mappings.get("properties", {})
             if properties:
-                _generate_configset(collection_name, properties, output_dir)
+                multi_valued = _observe_multi_valued_fields(source_dir, issues)
+                _generate_configset(collection_name, properties, output_dir,
+                                    multi_valued=multi_valued)
         except Exception as exc:
             issues.append(f"Could not generate schema for collection '{collection_name}': {exc}")
+
+
+# The sample document files a workload publishes beside its full corpus, smallest first. Every workload
+# ported so far names one in files.txt.
+_SAMPLE_CORPUS_NAMES = ("documents-1k.json.bz2", "documents-1000.json.bz2",
+                        "documents-100.json.bz2", "documents-60.json.bz2",
+                        "documents-1k.json", "documents.json.bz2")
+
+
+def _observe_multi_valued_fields(source_dir: str, issues: list) -> set:
+    """Return the field names a sample of the corpus was seen to carry as a list.
+
+    ⚠️ An OpenSearch mapping does not state arity: nested's `tag` is declared ``{"type": "keyword"}``
+    and every document writes ``["vb6", "progress-bar"]``. Solr refuses such a document outright —
+    ``multiple values encountered for non multiValued field tag`` — so the arity has to come from the
+    only place that states it, the corpus.
+
+    A list of objects is *not* reported: that is a nested field and becomes child documents, which the
+    mapping does declare.
+
+    ⇒ Where no sample is present the set is empty and the issue is reported rather than guessed: a
+    blanket multiValued would change what an operation computes (measured: Solr SQL's `avg` over a
+    single-valued integer column answers 50 where the same values multiValued answer 49.5).
+    """
+    for name in _SAMPLE_CORPUS_NAMES:
+        path = os.path.join(source_dir, name)
+        if os.path.isfile(path):
+            break
+    else:
+        issues.append(
+            "No sample corpus file was found beside the workload, so field arity could not be "
+            "observed and every field is declared single-valued. A field the corpus writes as an "
+            "array will be refused by Solr with 'multiple values encountered for non multiValued "
+            "field'. Download one of %s into the workload directory and convert again."
+            % ", ".join(_SAMPLE_CORPUS_NAMES[:2]))
+        return set()
+
+    found = set()
+    try:
+        opener = bz2.open if path.endswith(".bz2") else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            for count, line in enumerate(handle):
+                if count >= _SAMPLE_DOCUMENT_LIMIT:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(doc, dict):
+                    found.update(_list_valued_paths(doc))
+    except OSError as exc:
+        issues.append("Could not read the sample corpus '%s' to observe field arity: %s"
+                      % (name, exc))
+        return set()
+
+    logger.info("Observed %d multi-valued field(s) in '%s': %s",
+                len(found), name, ", ".join(sorted(found)) or "none")
+    return found
+
+
+# ⭐ Read enough documents that a field carrying one value in the first few is still caught. nested's
+# corpus writes `tag` as an array in every document, but a corpus need not — and a field observed
+# single-valued throughout a sample is declared single-valued, which is a claim about the sample.
+_SAMPLE_DOCUMENT_LIMIT = 1000
+
+
+def _list_valued_paths(doc, prefix=""):
+    """Field names, flattened the way the runner flattens them, seen holding a list of plain values."""
+    found = set()
+    for key, value in doc.items():
+        name = "%s_%s" % (prefix, str(key).replace(".", "_")) if prefix \
+            else str(key).replace(".", "_")
+        if isinstance(value, dict):
+            found.update(_list_valued_paths(value, name))
+        elif isinstance(value, list):
+            # A list of objects is a nested field, which the mapping declares and which becomes child
+            # documents; only a list of plain values makes the field itself multi-valued.
+            if value and all(isinstance(item, dict) for item in value):
+                continue
+            found.add(name)
+    return found
 
 
 def _write_converted_workload_json(
@@ -821,7 +944,8 @@ def _process_collected_files(source_dir: str, output_dir: str, issues: list, ski
                 f.write(converted_text)
 
 
-def _generate_configset(collection_name: str, properties: dict, output_dir: str) -> str:
+def _generate_configset(collection_name: str, properties: dict, output_dir: str,
+                        multi_valued=()) -> str:
     """
     Generate a Solr configset directory from OpenSearch field mappings.
 
@@ -834,7 +958,8 @@ def _generate_configset(collection_name: str, properties: dict, output_dir: str)
     configset_dir = os.path.join(output_dir, "configsets", collection_name)
     os.makedirs(configset_dir, exist_ok=True)
 
-    field_defs, copy_fields, date_formats = translate_opensearch_mapping(properties)
+    field_defs, copy_fields, date_formats = translate_opensearch_mapping(
+        properties, multi_valued=multi_valued)
     schema_xml = generate_schema_xml(field_defs, copy_fields=copy_fields, unique_key="id")
 
     # Write schema.xml

@@ -34,7 +34,7 @@ from .field import normalize_field_name
 logger = logging.getLogger(__name__)
 
 
-def translate_opensearch_query(body: dict) -> dict:
+def translate_opensearch_query(body: dict, nested: dict = None) -> dict:
     """
     Translate an OpenSearch query DSL dict to Solr query parameters.
 
@@ -78,16 +78,17 @@ def translate_opensearch_query(body: dict) -> dict:
             fq_list.append(fq_str)
             return {"q": "*:*", "fq": fq_list}
 
-    q = _translate_query_node(query, fq_list=fq_list)
+    q = _translate_query_node(query, fq_list=fq_list, nested=nested)
     return {"q": q, "fq": fq_list}
 
 
-def extract_sort_parameter(body: dict) -> str:
+def extract_sort_parameter(body: dict, nested: dict = None) -> str:
     """
     Extract a Solr sort string from an OpenSearch sort clause.
 
     Args:
         body: OpenSearch query body dict with optional "sort" key
+        nested: Optional dict collecting referenced queries, for a sort over a nested field
 
     Returns:
         Solr sort parameter string (e.g., "name_raw desc, _score asc")
@@ -113,35 +114,90 @@ def extract_sort_parameter(body: dict) -> str:
             for field, order_info in clause.items():
                 if field == "_score":
                     continue
-                # Normalize field name
-                field = normalize_field_name(field)
+                order = "asc"
                 if isinstance(order_info, dict):
                     order = order_info.get("order", "asc")
                 elif isinstance(order_info, str):
                     order = order_info
-                else:
-                    order = "asc"
+                nested_sort = _nested_sort_expression(field, order_info, nested)
+                if nested_sort:
+                    solr_sorts.append("%s %s" % (nested_sort, order))
+                    continue
+                # Normalize field name
+                field = normalize_field_name(field)
                 solr_sorts.append(f"{field} {order}")
     return ", ".join(solr_sorts) if solr_sorts else None
+
+
+def _nested_sort_expression(field: str, order_info, nested: dict):
+    """The Solr sort expression for a sort over a nested field, or None if this is an ordinary sort.
+
+    ⭐ ``childfield(field, $bjq)`` is the nested ``mode: max`` sort: it reads a child document's value
+    for the parent the block-join query in ``$bjq`` produced. Where the block join is put matters —
+    with it in ``q`` the sort returned 74 of the sample's 80 matching documents, dropping the 6
+    questions with no answers (upstream's own ``nested`` + ``match_all`` returns the same 74, so that
+    is a different query, not a Solr limitation). With ``q`` the parent query and the block join in a
+    separate ``bjq`` parameter, it returned all 80 in upstream's order.
+
+    ⚠️ The parent's flattened copy — ``field(answers_date,max)`` — is *also* correct, and only if it is
+    written: measured on the sample with the copy written it gave upstream's order exactly, and with the
+    copy merely declared in the schema it silently returned all 90 documents in id order. The
+    block-join form does not depend on that copy existing, so it is the one emitted.
+    """
+    if not isinstance(order_info, dict):
+        return None
+    path = (order_info.get("nested") or {}).get("path")
+    if not path:
+        return None
+    if nested is None:
+        logger.warning(
+            "sort over nested path '%s' cannot be translated here: it needs a block-join query passed "
+            "by reference, and no parameter block is available", path)
+        return None
+    mode = order_info.get("mode", "max")
+    if mode not in ("max", "min"):
+        # avg/sum/median over a nested leaf have no childfield equivalent. Reported rather than
+        # silently sorted by something else — a wrong sort order is not visible in a hit count.
+        logger.warning("sort mode '%s' over nested path '%s' has no Solr childfield equivalent",
+                       mode, path)
+        return None
+    prefix = str(path).replace(".", "_")
+    leaf = field
+    for candidate in (str(path) + ".", prefix + "_"):
+        if leaf.startswith(candidate):
+            leaf = leaf[len(candidate):]
+            break
+    child_field = child_field_name(path, str(leaf).replace(".", "_"))
+    nested[_NESTED_SORT_PARAM] = "{!parent which='%s:true'}%s:%s" % (
+        _PARENT_MARKER_FIELD, _CHILD_PATH_FIELD, prefix)
+    # ⚠️ childfield picks the value the block join's scoring produced, which for a `desc` sort over a
+    # date is the maximum. `min` is not expressible this way and is reported above.
+    return "childfield(%s,$%s)" % (child_field, _NESTED_SORT_PARAM)
 
 
 # ---------------------------------------------------------------------------
 # Internal helper functions
 # ---------------------------------------------------------------------------
 
-def _translate_query_node(node: dict, fq_list: list = None) -> str:
+def _translate_query_node(node: dict, fq_list: list = None, nested: dict = None) -> str:
     """Recursively translate a single OpenSearch query node to Solr syntax.
 
     Args:
         node: OpenSearch query node dict
         fq_list: Optional list to collect Solr fq filter strings. When provided,
                  bool.filter clauses are appended here instead of inlined in q.
+        nested: Optional dict collecting the referenced queries a ``nested`` clause needs, keyed by
+                the parameter name the ``q`` refers to. Solr's block-join parser cannot take its child
+                query inline inside a boolean clause, so it arrives by reference.
     """
     if not node or not isinstance(node, dict):
         return "*:*"
 
     if "match_all" in node:
         return "*:*"
+
+    if "nested" in node:
+        return _translate_nested_clause(node["nested"], nested)
 
     if "match_none" in node:
         return "-*:*"
@@ -391,7 +447,7 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
             if isinstance(clauses, dict):
                 clauses = [clauses]
             for clause in clauses:
-                sub = _translate_query_node(clause, fq_list=fq_list)
+                sub = _translate_query_node(clause, fq_list=fq_list, nested=nested)
                 if sub and sub != "*:*":
                     # ⛔ A purely negative group matches nothing in Lucene: `+(-(URL:*x*))` returned 0
                     # where `-(URL:*x*)` beside it returned 564. A nested must_not therefore needs
@@ -423,7 +479,7 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
         shoulds = bool_q.get("should", [])
         if isinstance(shoulds, dict):
             shoulds = [shoulds]
-        should_parts = [_translate_query_node(s, fq_list=fq_list) for s in shoulds]
+        should_parts = [_translate_query_node(s, fq_list=fq_list, nested=nested) for s in shoulds]
         should_parts = [s for s in should_parts if s and s != "*:*"]
         if should_parts:
             parts.append("(" + " ".join(should_parts) + ")")
@@ -438,6 +494,159 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
         list(node.keys()),
     )
     return "*:*"
+
+
+# The fields the runner writes to mark a block of parent and child documents. Named the same way in
+# the schema generator and the runner; a block join needs a query for each side and neither is
+# expressible as a negation.
+_CHILD_PATH_FIELD = "_nested_path_"
+_PARENT_MARKER_FIELD = "_nested_parent_"
+
+# The prefix of the referenced-parameter names a nested clause's child query is passed under.
+_NESTED_PARAM_PREFIX = "nq"
+
+# ⭐ The filter restricting a query to the documents upstream would have counted. A nested field's
+# objects are separate documents in Solr and share the collection with their parents, so a query that
+# does not exclude them counts both: measured on the 1,000-document sample, match_all answered 1,000
+# upstream and 2,977 in Solr — 1,000 questions plus 1,977 answers.
+#
+# ⚠️ The parent marker is *not* the right filter for this. It marks a document that has children, and
+# 40 of the sample's 1,000 questions have none — filtering on it answered 960. "Has no nested path" is
+# the property that matches upstream's document set, and it answered 1,000 exactly. Measured on the
+# other three operations, adding it changes nothing: term 90, nested 3, and the nested sort's 90 in the
+# same order.
+_TOP_LEVEL_ONLY = "-%s:[* TO *]" % _CHILD_PATH_FIELD
+
+# Whether the workload being converted declares a nested field at all, set by the converter from the
+# mapping.
+#
+# ⚠️ The scope filter cannot be emitted unconditionally: a collection with no nested field has no
+# _nested_path_ to negate, and Solr answers `undefined field: "_nested_path_"` and refuses the query
+# outright — measured against a collection from another workload. So it is emitted only where the
+# mapping declares the field, which is also the only place child documents exist.
+_HAS_NESTED_FIELDS = False
+
+
+def set_nested_fields_present(present: bool):
+    """Say whether the workload under conversion declares a nested field.
+
+    The scope filter belongs to every operation of such a workload, including those with no nested
+    clause of their own — match_all is exactly the operation that needed it — so it cannot be derived
+    from the operation body and has to come from the mapping.
+    """
+    global _HAS_NESTED_FIELDS  # noqa: PLW0603 — same convention as the converter's target collection
+    _HAS_NESTED_FIELDS = bool(present)
+
+# The parameter a nested sort's block-join query is passed under.
+_NESTED_SORT_PARAM = "bjq"
+
+
+def _translate_nested_clause(conf: dict, nested: dict) -> str:
+    """Translate one ``nested`` clause into a Solr block-join query over child documents.
+
+    Upstream's ``{"nested": {"path": "answers", "query": ...}}`` selects parents having at least one
+    *object* satisfying the query. Solr's equivalent is ``{!parent which=<parents>}<child query>``,
+    where the child query carries both the path and the clause — the path alone is not enough:
+    measured on the 1,000-document sample, a childFilter of ``_nested_path_:answers`` returned a 2015
+    answer that the query excludes.
+
+    ⚠️ The child query cannot be written inline. Three spellings were measured against upstream's 1 hit
+    on the sample:
+
+    * ``+(tag:vb6) +({!parent which=...}+_nested_path_:answers +answer_date:[* TO D])`` → **0**. The
+      leading local-params parser consumes the whole clause and the boolean structure is lost.
+    * ``{!parent which=...}...`` as the entire ``q`` → **80**, i.e. the tag clause vanished.
+    * ``_query_:"{!parent which=... v=$nq0}"`` with the child query in a referenced parameter → **1**,
+      agreeing with upstream.
+
+    ⇒ So the child query is collected into *nested* and referenced. An inline ``v='...'`` form is not a
+    substitute: a child value containing a single quote — ``answer_user:"O'Brien"`` — is a syntax error
+    ("Missing end quote for string at pos 40") whether the quote is escaped or not, while the referenced
+    form parses it.
+    """
+    if not isinstance(conf, dict):
+        return "*:*"
+    path = conf.get("path")
+    inner = conf.get("query")
+    if not path or not isinstance(inner, dict):
+        logger.warning("nested clause states no path or query — cannot translate to a block join")
+        return "*:*"
+    if nested is None:
+        # Nothing to carry the referenced parameter, so there is nowhere to put the child query. Saying
+        # so is the point: a fallback to *:* here would widen the clause to every document.
+        logger.warning(
+            "nested clause on path '%s' cannot be translated in this context: Solr's block-join parser "
+            "needs its child query passed by reference, and no parameter block is available", path)
+        return "*:*"
+
+    child_q = _translate_query_node(_rename_to_child_fields(inner, path),
+                                    fq_list=None, nested=nested)
+    path_field = str(path).replace(".", "_")
+    param = "%s%d" % (_NESTED_PARAM_PREFIX, len(nested))
+    nested[param] = "+%s:%s +(%s)" % (_CHILD_PATH_FIELD, path_field, child_q)
+    return '_query_:"{!parent which=\'%s:true\' v=$%s}"' % (_PARENT_MARKER_FIELD, param)
+
+
+def child_field_name(path: str, leaf: str) -> str:
+    """The name a child document's field takes: the singular of the path, then the leaf.
+
+    ⚠️ Two different fields carry a nested leaf, and they are not interchangeable. The child documents
+    hold ``answer_date`` — the singular — and the parent holds a flattened multi-valued copy named
+    ``answers_date``. A block-join child query must name the former; a `mode: max` sort over the parent
+    may name either. Using the flattened name inside a child query asks for a field no child document
+    has, and Solr answers 0 rather than failing.
+    """
+    prefix = str(path).replace(".", "_")
+    singular = prefix[:-1] if prefix.endswith("s") and len(prefix) > 1 else "%s_item" % prefix
+    return "%s_%s" % (singular, leaf)
+
+
+def _rename_to_child_fields(node, path):
+    """Rewrite every field name in a nested clause's query to the child document's spelling.
+
+    Upstream writes a nested leaf fully qualified — ``answers.date`` — and normalisation alone turns
+    that into ``answers_date``, which is the *parent's* flattened copy, not the child's field. The
+    child query would then select nothing.
+    """
+    prefix = str(path) + "."
+    prefix_underscored = str(path).replace(".", "_") + "_"
+
+    def rename(name):
+        if not isinstance(name, str):
+            return name
+        for candidate in (prefix, prefix_underscored):
+            if name.startswith(candidate):
+                return child_field_name(path, name[len(candidate):].replace(".", "_"))
+        return name
+
+    def walk(value):
+        if isinstance(value, dict):
+            out = {}
+            for key, sub in value.items():
+                # Only a field position is renamed. A leaf-clause key ("range", "gte", "boost") is not
+                # a field name, and the field sits one level below the clause name.
+                if key in _FIELD_KEYED_CLAUSES and isinstance(sub, dict):
+                    out[key] = {rename(field): walk(spec) if isinstance(spec, (dict, list)) else spec
+                                for field, spec in sub.items()}
+                elif key == "field" and isinstance(sub, str):
+                    # ⚠️ An aggregation names its field in a *value*, not a key: a date_histogram is
+                    # {"field": "answers.date"}. Renaming keys alone left the facet computed over the
+                    # domain of child documents while naming the parent's flattened copy, which no child
+                    # document carries — every bucket would have been empty, and an empty facet reads
+                    # like a working operation.
+                    out[key] = rename(sub)
+                else:
+                    out[key] = walk(sub)
+            return out
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        return value
+
+    return walk(node)
+
+
+# The clause types whose immediate keys are field names.
+_FIELD_KEYED_CLAUSES = ("term", "terms", "match", "match_phrase", "range", "wildcard", "prefix")
 
 
 def _translate_terms_clause(field: str, values: list) -> str:
@@ -625,9 +834,13 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
         return {"query": "*:*"}
 
     fq_list = []
+    # The referenced child queries a nested clause needs. Solr's block-join parser cannot take its
+    # child query inline inside a boolean clause, so each one is collected here and passed in a params
+    # block beside the query.
+    nested = {}
     query_val = body.get("query")
     if isinstance(query_val, dict):
-        translated = translate_opensearch_query(body)
+        translated = translate_opensearch_query(body, nested=nested)
         q = translated["q"]
         fq_list = translated["fq"]
     else:
@@ -645,20 +858,47 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
         if post_fq and post_fq != "*:*":
             fq_list = list(fq_list) + ["{!tag=%s}%s" % (_POST_FILTER_TAG, post_fq)]
 
+    # Restrict the hits to the documents upstream counts. A child document is a document of its own in
+    # Solr, so without this every operation of a nested workload counts the objects too — match_all
+    # answered 2,977 against upstream's 1,000 on the sample.
+    if _HAS_NESTED_FIELDS:
+        fq_list = list(fq_list) + [_TOP_LEVEL_ONLY]
+
     if fq_list:
         result["filter"] = fq_list
 
     if "size" in body:
         result["limit"] = body["size"]
 
-    sort_str = extract_sort_parameter(body)
+    sort_str = extract_sort_parameter(body, nested=nested)
     if sort_str:
         result["sort"] = sort_str
 
+    # An inner_hits block asks for the matching child objects beside each parent. Solr's equivalent is
+    # the [child] document transformer, and it needs both the query — not merely "is a child" — and its
+    # own fl. Measured on the sample: a childFilter of _nested_path_:answers alone returned 2 children
+    # for a document where inner_hits returned 1, including a 2015 answer the query excludes; and
+    # without the inner fl the count was right and every child came back as {}.
+    child_fl = _inner_hits_field_list(body, nested)
+    if child_fl:
+        result["fields"] = child_fl
+
     aggs = body.get("aggs") or body.get("aggregations")
     if aggs and isinstance(aggs, dict):
+        facets, agg_domain = _nested_aggregation_domain(aggs)
+        if agg_domain:
+            # A `nested` aggregation counts *child* documents, so the facet is computed over the
+            # children rather than the parents the query selects. Measured: over
+            # q=_nested_path_:answers, all 91 monthly buckets are identical to upstream's, sum 1977.
+            aggs = facets
         facets = _convert_aggregations_to_facets(aggs, _date_bounds_from_query(body))
         if facets:
+            if agg_domain:
+                for facet in facets.values():
+                    if isinstance(facet, dict):
+                        domain = dict(facet.get("domain") or {})
+                        domain["query"] = agg_domain
+                        facet["domain"] = domain
             # A post_filter is by definition not applied to the aggregations. Each top-level facet
             # excludes it by the tag the filter carries; without this the facets would be computed over
             # the narrowed set, which is the very thing a post_filter exists to avoid.
@@ -670,7 +910,86 @@ def translate_to_solr_json_dsl(body: dict) -> dict:
                         facet["domain"] = domain
             result["facet"] = facets
 
+    # The child queries, referenced by the query, the sort and the [child] transformer alike.
+    if nested:
+        result["params"] = dict(nested)
+
     return result
+
+
+def _nested_aggregation_domain(aggs: dict) -> tuple:
+    """Unwrap a single ``nested`` aggregation, returning (its sub-aggregations, the child-set query).
+
+    ⭐ A ``nested`` aggregation is not a bucket type at all: it changes the *set of documents* the
+    aggregations beneath it are computed over, from the parents to the objects of one nested path. Solr
+    states that as a facet domain, and since the objects are child documents the domain is a query
+    selecting them.
+
+    Left untranslated, this reported "Unsupported aggregation type 'nested'" and the operation became a
+    search with a hit count and no facet at all — the shape of a silent zero.
+    """
+    if len(aggs) != 1:
+        return aggs, None
+    name, agg_def = next(iter(aggs.items()))
+    if not isinstance(agg_def, dict) or "nested" not in agg_def:
+        return aggs, None
+    path = (agg_def.get("nested") or {}).get("path")
+    sub = agg_def.get("aggs") or agg_def.get("aggregations")
+    if not path or not isinstance(sub, dict):
+        logger.warning("nested aggregation '%s' states no path or sub-aggregation", name)
+        return aggs, None
+    # The leaf a sub-aggregation names is qualified by the path upstream and belongs to the child
+    # document here, so it is renamed the same way a nested query's fields are.
+    return _rename_to_child_fields(sub, path), "%s:%s" % (_CHILD_PATH_FIELD,
+                                                          str(path).replace(".", "_"))
+
+
+def _inner_hits_field_list(body: dict, nested: dict) -> str:
+    """The ``fl`` an ``inner_hits`` block needs, or None if the body asks for no inner hits.
+
+    ⚠️ Both parts are required and each was measured missing:
+
+    * without ``childFilter`` carrying the nested *query*, the transformer returned every child of the
+      block — 2 where ``inner_hits`` returned 1, and the extra was a 2015 answer the query excludes.
+      It was silent for 2 of the 3 documents checked, which is how it would have passed a spot check.
+    * without its own ``fl``, a child is rendered through the *outer* one. Measured on the sample with
+      the same childFilter and limit: outer ``fl=*`` returned full children, outer ``fl=id`` returned
+      ``{"id": ...}`` and nothing else, and outer ``fl=qid,tag`` — parent fields a child does not
+      have — returned ``{}`` per child while the count stayed right. So the emptiness follows from the
+      outer list, not from omitting the inner one; naming the child's own fields makes it independent
+      of what the parent asks for.
+
+    With ``childFilter``, ``limit`` and ``fl=<singular>_*`` the inner hits agree with upstream on all
+    3 matching documents of the sample: same parents, same child counts, same users in the same order.
+    """
+    found = _find_inner_hits(body.get("query"))
+    if not found:
+        return None
+    path, conf = found
+    size = conf.get("size", 3) if isinstance(conf, dict) else 3
+    # The child query is already collected under a referenced parameter; the transformer refers to the
+    # same one, so the children returned are exactly the children the query matched.
+    param = "%s0" % _NESTED_PARAM_PREFIX if not nested else sorted(nested)[0]
+    child_fields = child_field_name(path, "*")
+    return "*,[child childFilter=$%s limit=%s fl=%s]" % (param, size, child_fields)
+
+
+def _find_inner_hits(node):
+    """The (path, inner_hits) of the first nested clause asking for inner hits, or None."""
+    if isinstance(node, dict):
+        conf = node.get("nested")
+        if isinstance(conf, dict) and isinstance(conf.get("inner_hits"), dict):
+            return conf.get("path"), conf["inner_hits"]
+        for value in node.values():
+            found = _find_inner_hits(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_inner_hits(item)
+            if found:
+                return found
+    return None
 
 
 def _date_bounds_from_query(body: dict) -> tuple:
