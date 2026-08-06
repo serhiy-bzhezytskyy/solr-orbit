@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from solrorbit.conversion.ppl import translate_ppl_to_sql
+from solrorbit.conversion.ppl import facet_body_for_piped_query, translate_ppl_to_sql
 
 
 class TestPipedQueryTranslation:
@@ -239,3 +239,86 @@ class TestPipedQueryTranslation:
 
     def test_a_query_with_no_source_clause_is_refused(self):
         assert translate_ppl_to_sql("search index=big5 | head 10") is None
+
+
+class TestFacetBodyForPipedQuery:
+    """
+    Shapes the SQL surface cannot express but the JSON Facet API can.
+
+    ⭐ The point of this surface: Solr SQL answers a bare null to sum(ResolutionWidth+1), which reads as an
+    empty result. Its facet spelling is sum(sum(ResolutionWidth,1)) and it is exact — measured, Solr
+    answers 2,268,791,624 where upstream answers 2,147,483,647 (Integer.MAX_VALUE, because upstream clamps
+    at 32 bits) and the true total counted over the corpus is 2,268,791,624.
+    """
+
+    def test_an_aggregate_over_a_computed_expression_becomes_a_facet_function(self):
+        body = facet_body_for_piped_query(
+            "source = cb | stats sum(ResolutionWidth), sum(ResolutionWidth+1)")
+        assert body["facet"]["agg_1"] == "sum(ResolutionWidth)"
+        assert body["facet"]["agg_2"] == "sum(sum(ResolutionWidth,1))"
+        assert body["limit"] == 0
+
+    def test_each_arithmetic_operator_has_its_function(self):
+        for expression, expected in (("ClientIP-1", "sub(ClientIP,1)"),
+                                     ("A*2", "product(A,2)"),
+                                     ("A/2", "div(A,2)")):
+            body = facet_body_for_piped_query("source = cb | stats sum(%s)" % expression)
+            assert body["facet"]["agg_1"] == "sum(%s)" % expected
+
+    def test_a_grouping_stats_is_left_to_the_sql_surface(self):
+        # A grouping by fields is a terms facet, which the SQL translator already carries; answering here
+        # too would give two spellings of the same operation.
+        assert facet_body_for_piped_query("source = cb | stats count() by URL") is None
+
+    def test_a_date_format_eval_becomes_a_range_facet_at_the_named_resolution(self):
+        # '%Y-%m-%d %H:%i:00' names minutes, so the gap is a minute. Measured against both engines: 1,436
+        # non-empty minute buckets here, and every one of upstream's 10 rows agrees.
+        body = facet_body_for_piped_query(
+            "source = cb | where CounterID = 62 and EventDate >= '2013-07-14' "
+            "and EventDate <= '2013-07-15' | eval M = date_format(EventTime, '%Y-%m-%d %H:%i:00') "
+            "| stats count() as PageViews by M | sort M | head 10")
+        facet = body["facet"]["M"]
+        assert facet["type"] == "range"
+        assert facet["field"] == "EventTime"
+        assert facet["gap"] == "+1MINUTE"
+        assert facet["mincount"] == 1
+        assert facet["facet"]["PageViews"] == "countvals(id)"
+
+    def test_the_range_facet_takes_its_bounds_from_the_query_filter(self):
+        # Solr refuses a range facet with no start; a guessed bound that misses the data produces an empty
+        # facet, which reads as a working operation.
+        body = facet_body_for_piped_query(
+            "source = cb | where EventDate >= '2013-07-14' and EventDate <= '2013-07-15' "
+            "| eval M = date_format(EventTime, '%Y-%m-%d %H:00:00') | stats count() by M")
+        assert body["facet"]["M"]["start"] == "2013-07-14T00:00:00Z"
+        assert body["facet"]["M"]["gap"] == "+1HOUR"
+
+    def test_the_filter_is_a_solr_query_not_a_sql_predicate(self):
+        # ⚠️ An earlier version of this test allowed an empty body, so it passed while the filter still
+        # carried `CounterID = 62 and …` — a predicate Solr does not understand. It asserts the clauses now.
+        body = facet_body_for_piped_query(
+            "source = cb | where CounterID = 62 and EventDate >= '2013-07-14' "
+            "and EventDate <= '2013-07-15' "
+            "| eval M = date_format(EventTime, '%Y-%m-%d %H:%i:00') | stats count() by M")
+        assert body is not None
+        assert "CounterID:62" in body["filter"]
+        assert all(" = " not in clause for clause in body["filter"])
+        assert any(clause.startswith("EventDate:[") for clause in body["filter"])
+
+    def test_an_ungrouped_aggregation_needs_no_filter_key(self):
+        body = facet_body_for_piped_query("source = cb | stats sum(ResolutionWidth+1)")
+        assert "filter" not in body
+
+    def test_an_eval_that_is_not_a_date_format_is_refused(self):
+        # A computed value has no facet spelling; emitting the rest would measure a different query. Two
+        # forms, because the first alone left the refusal to the *grouping* check rather than to the eval
+        # one, so a mutation removing the eval guard still passed.
+        assert facet_body_for_piped_query(
+            "source = cb | eval const = 1 | stats count() by const") is None
+        assert facet_body_for_piped_query(
+            "source = cb | eval const = 1 | stats count()") is None
+        assert facet_body_for_piped_query(
+            "source = cb | eval m = extract(minute from EventTime) | stats count()") is None
+
+    def test_a_query_with_no_stats_is_refused(self):
+        assert facet_body_for_piped_query("source = cb | head 10") is None

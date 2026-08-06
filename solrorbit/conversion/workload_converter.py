@@ -41,7 +41,7 @@ import shutil
 from datetime import datetime
 
 from .detector import is_opensearch_workload
-from .ppl import source_index, translate_ppl_to_sql
+from .ppl import facet_body_for_piped_query, source_index, translate_ppl_to_sql
 from .query import translate_to_solr_json_dsl
 
 logger = logging.getLogger(__name__)
@@ -1156,6 +1156,21 @@ def _convert_ppl_operation(op, issues, skipped):
                   or source_index(query)
                   or _TARGET_COLLECTION)
     statement = translate_ppl_to_sql(query, collection=collection)
+    if statement is None:
+        # ⭐ A shape the SQL surface cannot express may still have a JSON Facet spelling: an aggregation
+        # over a computed expression is `sum(sum(field,1))` there, and exact. Try that before reporting
+        # the operation as uncarried.
+        facet_body = facet_body_for_piped_query(query, collection=collection)
+        if facet_body is not None:
+            if not collection:
+                issues.append("Piped operation '%s' has no collection to query." % op_name)
+                return
+            for key in [k for k in op if k not in ("name",)]:
+                del op[key]
+            op["operation-type"] = "search"
+            op["body"] = facet_body
+            op["collection"] = collection
+            return
     if statement is None:
         issues.append(
             "Operation '%s' is a piped query using an operator Solr SQL has no spelling for "

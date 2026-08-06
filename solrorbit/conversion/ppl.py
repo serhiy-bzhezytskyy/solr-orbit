@@ -59,11 +59,230 @@ UNTRANSLATABLE = (
     "length(",
 )
 
-# An aggregation over a computed expression rather than a bare column. Solr SQL answers a bare "null" to
-# sum(ResolutionWidth+1) while accepting sum(ResolutionWidth), so there is no faithful statement to emit —
-# and a bare "null" is exactly the kind of failure that would otherwise be read as an empty result.
+# An aggregation over a computed expression rather than a bare column. Solr's *SQL* layer answers a bare
+# "null" to sum(ResolutionWidth+1) while accepting sum(ResolutionWidth) — a bare null being exactly the
+# failure that reads as an empty result — so such a query has no SQL spelling.
+#
+# ⭐ Its JSON Facet spelling does exist: `sum(sum(ResolutionWidth,1))` is accepted and exact. Measured on
+# clickbench's q30, Solr answers 2,268,791,624 where upstream answers 2,147,483,647 — Integer.MAX_VALUE,
+# because upstream clamps at 32 bits. The true total counted over the corpus is 2,268,791,624.
+#
+# ⇒ So these are routed to a facet body by facet_body_for_piped_query() rather than reported as
+# untranslatable. The SQL guard stays, because the SQL surface genuinely cannot express them.
 _AGGREGATE_OF_EXPRESSION = re.compile(
     r"\b(?:sum|avg|min|max)\(\s*[^()]*[-+*/][^()]*\)", re.IGNORECASE)
+
+# The arithmetic operators a piped expression may use, and their Solr function-query spellings. A Solr
+# facet function takes arguments rather than infix operators: `ResolutionWidth+1` is `sum(ResolutionWidth,1)`.
+_INFIX_TO_FUNCTION = {"+": "sum", "-": "sub", "*": "product", "/": "div"}
+
+
+def _arithmetic_to_function(expression):
+    """Rewrite one infix arithmetic expression as a Solr function call.
+
+    Only the single-operator forms the workloads use are handled — `field+1`, `field-2` — since a general
+    expression parser would be a different piece of work and a partial one would mistranslate silently.
+    """
+    match = re.match(r"^\s*([`\w.]+)\s*([-+*/])\s*(\d+(?:\.\d+)?)\s*$", expression)
+    if not match:
+        return None
+    field, operator, operand = match.groups()
+    function = _INFIX_TO_FUNCTION.get(operator)
+    if not function:
+        return None
+    return "%s(%s,%s)" % (function, _quote_identifier(field.strip("`")).strip("`"), operand)
+
+
+def facet_body_for_piped_query(query, collection=None):
+    """Translate a piped query into a Solr JSON *facet* body, for the shapes SQL cannot express.
+
+    Returns a body dict, or None when this surface cannot express the query either. Two shapes reach it:
+    an aggregation over a computed expression (`sum(ResolutionWidth+1)`), and a `stats` whose aggregations
+    are all facet functions. Anything else stays with the SQL translator.
+    """
+    masked, tokens = _mask_jinja(query)
+    source, stages = _split_stages(masked)
+    if not source.lower().startswith("source"):
+        return None
+    _, leading = _parse_source(source)
+
+    where = [_translate_predicate(leading)] if leading else []
+    aggregations = None
+    time_bucket = None      # (alias, field, gap) when the query buckets by a formatted timestamp
+    for stage in stages:
+        verb = stage.split()[0].lower() if stage.split() else ""
+        if verb == "where":
+            where.append(_translate_predicate(stage[len("where"):].strip()))
+        elif verb == "eval":
+            # A `date_format` eval is a time bucket: the format string says how coarse. Any other eval is
+            # a computed value with no facet spelling, so the query is left to be reported.
+            bucket = _time_bucket_from_eval(stage[len("eval"):].strip())
+            if bucket is None:
+                return None
+            time_bucket = bucket
+        elif verb == "stats":
+            body = _STATS_OPTION.sub("", stage[len("stats"):].strip()).strip()
+            grouped = re.search(r"\s+by\s+(.+)$", body, re.IGNORECASE)
+            if grouped:
+                # Only a grouping by the eval'd time bucket is handled; a grouping by fields is a terms
+                # facet, which the SQL surface already carries.
+                if not time_bucket or grouped.group(1).strip() != time_bucket[0]:
+                    return None
+                body = body[:grouped.start()].strip()
+            aggregations = _split_top_level(body)
+        elif verb in ("head", "sort"):
+            continue           # neither changes an aggregation over the whole result set
+        else:
+            return None
+
+    if not aggregations:
+        return None
+
+    facet = {}
+    for index, aggregation in enumerate(aggregations):
+        aggregation = aggregation.strip()
+        alias = "agg_%d" % (index + 1)
+        as_marker = re.search(r"\s+as\s+(.+)$", aggregation, re.IGNORECASE)
+        if as_marker:
+            alias = as_marker.group(1).strip().strip("`")
+            aggregation = aggregation[:as_marker.start()].strip()
+        outer = re.match(r"^(sum|avg|min|max|count|dc)\(\s*(.*?)\s*\)$", aggregation, re.IGNORECASE)
+        if not outer:
+            return None
+        function, inner = outer.group(1).lower(), outer.group(2)
+        if function == "count":
+            facet[alias] = "countvals(id)"
+            continue
+        if function == "dc":
+            facet[alias] = "unique(%s)" % _quote_identifier(inner.strip("`")).strip("`")
+            continue
+        if re.search(r"[-+*/]", inner):
+            rewritten = _arithmetic_to_function(inner)
+            if rewritten is None:
+                return None
+            facet[alias] = "%s(%s)" % (function, rewritten)
+        else:
+            facet[alias] = "%s(%s)" % (function, _quote_identifier(inner.strip("`")).strip("`"))
+
+    if time_bucket:
+        # The aggregations move inside a range facet over the bucketed field, one bucket per interval.
+        # ⚠️ mincount is 1 deliberately: upstream's date_format produces a row only where a document
+        # falls, so emitting empty intervals would report buckets it never had.
+        alias, field, gap = time_bucket
+        bounds = _date_bounds_from_filters(where, field)
+        if bounds is None:
+            return None
+        facet = {alias: dict({"type": "range", "field": field, "gap": gap,
+                             "start": bounds[0], "end": bounds[1], "mincount": 1},
+                            facet=facet)}
+
+    body = {"query": "*:*", "limit": 0, "facet": facet}
+    if where:
+        # ⚠️ A facet body's filter is a *Solr query*, not a SQL predicate: emitting `CounterID = 62 and …`
+        # left the operation filtering on nothing Solr understands.
+        clauses = []
+        for clause in where:
+            rendered = _predicate_to_solr_query(_unmask_jinja(clause, tokens))
+            if rendered is None:
+                return None
+            clauses.extend(rendered)
+        body["filter"] = clauses
+    return body
+
+
+def _predicate_to_solr_query(predicate):
+    """Render a translated SQL predicate as Solr query clauses, or None if it cannot be.
+
+    Only the conjunctive comparison forms the piped workloads use are handled — equality and a range on a
+    field, joined by `and`. A disjunction or a nested expression returns None rather than a query that
+    filters on something else.
+    """
+    if re.search(r"\bor\b|\(", predicate, re.IGNORECASE):
+        return None
+    clauses = []
+    ranges = {}
+    for part in re.split(r"\s+and\s+", predicate, flags=re.IGNORECASE):
+        part = part.strip()
+        match = re.match(r"^([`\w.]+)\s*(>=|<=|>|<|=|<>)\s*(.+)$", part)
+        if not match:
+            return None
+        field, operator, value = match.group(1).strip("`"), match.group(2), match.group(3).strip()
+        value = value.strip("'")
+        if operator == "=":
+            clauses.append("%s:%s" % (field, _quote_query_value(value)))
+        elif operator == "<>":
+            clauses.append("-%s:%s" % (field, _quote_query_value(value)))
+        else:
+            bound = ranges.setdefault(field, ["*", "*"])
+            if operator in (">=", ">"):
+                bound[0] = _facet_bound(value)
+            else:
+                bound[1] = _facet_bound(value, inclusive_end=True)
+    for field, (lower, upper) in ranges.items():
+        clauses.append("%s:[%s TO %s]" % (field, lower, upper))
+    return clauses
+
+
+def _quote_query_value(value):
+    """Quote a query value if it carries a character the parser would read as syntax."""
+    if re.search(r"[\s:()\[\]{}+\-!^\"~*?\\/]", value):
+        return '"%s"' % value.replace('"', '\\"')
+    return value
+
+
+# How a piped date_format's format string maps to a Solr range-facet gap. The finest unit the format
+# names is the bucket width: '%Y-%m-%d %H:%i:00' names minutes, so the gap is a minute.
+_DATE_FORMAT_GAPS = (
+    ("%s", "+1SECOND"),
+    ("%i", "+1MINUTE"),
+    ("%H", "+1HOUR"),
+    ("%d", "+1DAY"),
+    ("%m", "+1MONTH"),
+    ("%Y", "+1YEAR"),
+)
+
+
+def _time_bucket_from_eval(clause):
+    """Read an ``eval alias = date_format(field, 'fmt')`` stage as (alias, field, gap), or None."""
+    match = re.match(r"^([`\w.]+)\s*=\s*date_format\(\s*([`\w.]+)\s*,\s*'([^']*)'\s*\)$",
+                     clause.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    alias, field, fmt = match.groups()
+    gap = None
+    for token, candidate in _DATE_FORMAT_GAPS:
+        if token in fmt:
+            gap = candidate
+            break
+    if gap is None:
+        return None
+    return alias.strip("`"), _quote_identifier(field.strip("`")).strip("`"), gap
+
+
+def _date_bounds_from_filters(filters, field):
+    """Find the range a filter clause states for *field*, so the range facet has bounds.
+
+    Solr refuses a range facet with no start — "Missing required parameter: 'start'" — and the query's own
+    filter is the only honest source: a guessed bound that misses the data produces an empty facet, which
+    reads as a working operation.
+    """
+    for clause in filters:
+        for candidate in re.finditer(
+                r"([`\w.]+)\s*(>=|>)\s*'([^']+)'.*?\1\s*(<=|<)\s*'([^']+)'", clause, re.DOTALL):
+            lower, upper = candidate.group(3), candidate.group(5)
+            return _facet_bound(lower), _facet_bound(upper, inclusive_end=True)
+    return None
+
+
+def _facet_bound(value, inclusive_end=False):
+    """Render a date bound the way a Solr range facet takes it."""
+    text = str(value)
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        # A date with no time: as an end bound it must cover that whole day, since upstream's <= does.
+        return "%sT00:00:00Z%s" % (text, "+1DAY" if inclusive_end else "")
+    if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}", text):
+        return text.replace(" ", "T").rstrip("Z") + "Z"
+    return text
 
 # What a piped query returns when it states no `head`. Measured against a live node: `source = x |
 # fields y` answered with size=10000, total=10000.
