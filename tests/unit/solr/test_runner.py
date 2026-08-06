@@ -832,6 +832,31 @@ class TestIntegerCoercion(unittest.TestCase):
         self.assertEqual(2, docs[0]["n"])
 
 
+class TestCoordinatePairComponents(unittest.TestCase):
+    """
+    A [lon, lat] pair becomes both a point and its two components.
+
+    ⭐ The components are not decoration: Solr cannot take a WKT POLYGON without JTS, and this build ships
+    14 modules with spatial-extras not among them. A convex ring is the intersection of its edges'
+    half-planes, which {!frange} states over lat and lon — so without them geopoint's polygon operation has
+    nothing to filter on. A nested corpus like noaa's yields these from flattening; a flat pair does not.
+    """
+
+    def test_a_pair_yields_the_point_and_both_components(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "location": [7.0, 55.0]})
+        # ⚠️ GeoJSON order: the pair is [lon, lat] and the point is "lat,lon".
+        self.assertEqual("55.0,7.0", doc["location"])
+        self.assertEqual(55.0, doc["location_lat"])
+        self.assertEqual(7.0, doc["location_lon"])
+
+    def test_a_pair_that_is_not_numeric_is_left_alone(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "tags": ["a", "b"]})
+        self.assertEqual(["a", "b"], doc["tags"])
+        self.assertNotIn("tags_lat", doc)
+
+
 class TestSolrBinarySearch(unittest.TestCase):
     """
     A search whose response comes back in Solr's binary format.

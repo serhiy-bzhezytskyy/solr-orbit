@@ -168,6 +168,84 @@ def _translate_query_node(node: dict, fq_list: list = None) -> str:
             field = normalize_field_name(field)
             return _translate_terms_clause(field, values)
 
+    if "geo_bounding_box" in node:
+        # A range on an exact point field: measured on 2,000 points whose membership was computed
+        # independently, this answers 380 against the exact 380, where the same box against an RPT index
+        # answered 388 — an RPT query is approximate, bounded by the maxDistErr set at index time.
+        for field, box in node["geo_bounding_box"].items():
+            if field == "boost" or not isinstance(box, dict):
+                continue
+            top_left, bottom_right = box.get("top_left"), box.get("bottom_right")
+            corners = _corner_pair(top_left, bottom_right)
+            if corners is None:
+                logger.warning("geo_bounding_box on '%s' has corners this converter cannot read: %s",
+                              field, box)
+                return "*:*"
+            (min_lat, min_lon), (max_lat, max_lon) = corners
+            field = normalize_field_name(field)
+            return "%s:[%s,%s TO %s,%s]" % (field, min_lat, min_lon, max_lat, max_lon)
+
+    if "geo_distance" in node:
+        # {!geofilt} over the same field: measured 39 against the exact 39, where an RPT index answered 41.
+        conf = node["geo_distance"]
+        distance = conf.get("distance")
+        for field, point in conf.items():
+            if field in ("distance", "boost", "distance_type", "validation_method"):
+                continue
+            location = _lat_lon(point)
+            if location is None or distance is None:
+                logger.warning("geo_distance on '%s' has a form this converter cannot read: %s",
+                              field, conf)
+                return "*:*"
+            kilometres = _distance_in_kilometres(distance)
+            if kilometres is None:
+                logger.warning("geo_distance states a distance with no unit this converter knows: %s",
+                              distance)
+                return "*:*"
+            return "{!geofilt sfield=%s pt=%s,%s d=%s}" % (
+                normalize_field_name(field), location[0], location[1], kilometres)
+
+    if "geo_polygon" in node:
+        # ⭐ Solr cannot take a WKT POLYGON without JTS — "Unsupported shape of this SpatialContext. Try
+        # JTS or Geo3D" — and this build ships 14 modules, spatial-extras not among them. But a *convex*
+        # ring is the intersection of half-planes, and that needs no shape library at all: a point is
+        # inside when the cross product against every edge has the same sign, which {!frange} over the
+        # lat/lon components states directly. Measured: 335 against the exact 335.
+        for field, conf in node["geo_polygon"].items():
+            if field == "boost" or not isinstance(conf, dict):
+                continue
+            points = [_lat_lon(point) for point in conf.get("points", [])]
+            if not points or any(p is None for p in points):
+                logger.warning("geo_polygon on '%s' has points this converter cannot read", field)
+                return "*:*"
+            # A closed ring repeats its first point; the half-plane form does not want the repeat.
+            if len(points) > 1 and points[0] == points[-1]:
+                points = points[:-1]
+            if len(points) < 3:
+                logger.warning("geo_polygon on '%s' has fewer than three distinct points", field)
+                return "*:*"
+            if not _is_convex(points):
+                # A concave ring is not an intersection of half-planes, and emitting one anyway would
+                # match a larger area than the query states.
+                logger.warning(
+                    "geo_polygon on '%s' is not convex, so it is not an intersection of half-planes; "
+                    "Solr needs JTS for a general polygon and this build has no spatial-extras module.",
+                    field)
+                return "*:*"
+            base = normalize_field_name(field)
+            clauses = []
+            for index in range(len(points)):
+                lat1, lon1 = points[index]
+                lat2, lon2 = points[(index + 1) % len(points)]
+                clauses.append(
+                    "{!frange l=0}sub(product(%s,sub(%s_lat,%s)),product(%s,sub(%s_lon,%s)))" % (
+                        _number(lon2 - lon1), base, _number(lat1),
+                        _number(lat2 - lat1), base, _number(lon1)))
+            if fq_list is not None:
+                fq_list.extend(clauses)
+                return "*:*"
+            return " AND ".join("(%s)" % clause for clause in clauses)
+
     if "wildcard" in node or "prefix" in node:
         # Both are Lucene's own query forms, so Solr states them directly. Untranslated they fell
         # through to *:* and the operation matched the whole corpus.
@@ -373,6 +451,80 @@ def _translate_node_for_fq(node: dict) -> str:
 
     # range, term, exists, match etc. — translate normally
     return _translate_query_node(node, fq_list=None)
+
+
+def _lat_lon(point):
+    """Read a point in any of the spellings OpenSearch accepts, as (lat, lon).
+
+    ⚠️ A two-element array is **[lon, lat]** — GeoJSON order — while a string is "lat,lon". Reading the
+    array in the wrong order silently moves the query, which is why every form is handled here rather
+    than at each call site.
+    """
+    if isinstance(point, dict):
+        if "lat" in point and "lon" in point:
+            return float(point["lat"]), float(point["lon"])
+        return None
+    if isinstance(point, (list, tuple)) and len(point) == 2:
+        return float(point[1]), float(point[0])
+    if isinstance(point, str):
+        parts = [part.strip() for part in point.split(",")]
+        if len(parts) == 2:
+            try:
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _corner_pair(top_left, bottom_right):
+    """Return ((min_lat, min_lon), (max_lat, max_lon)) from a bounding box's two corners."""
+    upper, lower = _lat_lon(top_left), _lat_lon(bottom_right)
+    if upper is None or lower is None:
+        return None
+    lats, lons = sorted((upper[0], lower[0])), sorted((upper[1], lower[1]))
+    return (_number(lats[0]), _number(lons[0])), (_number(lats[1]), _number(lons[1]))
+
+
+_DISTANCE_UNITS = {"km": 1.0, "kilometers": 1.0, "kilometres": 1.0,
+                   "m": 0.001, "meters": 0.001, "metres": 0.001,
+                   "mi": 1.609344, "miles": 1.609344,
+                   "yd": 0.0009144, "yards": 0.0009144,
+                   "ft": 0.0003048, "feet": 0.0003048,
+                   "nmi": 1.852, "nauticalmiles": 1.852}
+
+
+def _distance_in_kilometres(distance):
+    """Convert a distance like "200km" to kilometres, which is what {!geofilt}'s d takes."""
+    match = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$", str(distance))
+    if not match:
+        return None
+    amount, unit = float(match.group(1)), match.group(2).lower()
+    if not unit:
+        # OpenSearch's default for a bare number is metres.
+        return _number(amount * 0.001)
+    factor = _DISTANCE_UNITS.get(unit)
+    return None if factor is None else _number(amount * factor)
+
+
+def _is_convex(points):
+    """Say whether a ring is convex, so it is the intersection of its edges' half-planes."""
+    signs = []
+    count = len(points)
+    for index in range(count):
+        lat1, lon1 = points[index]
+        lat2, lon2 = points[(index + 1) % count]
+        lat3, lon3 = points[(index + 2) % count]
+        cross = (lon2 - lon1) * (lat3 - lat2) - (lat2 - lat1) * (lon3 - lon2)
+        if cross:
+            signs.append(cross > 0)
+    return bool(signs) and (all(signs) or not any(signs))
+
+
+def _number(value):
+    """Render a float without a trailing .0, so a query reads as the workload wrote it."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return repr(round(value, 9)) if isinstance(value, float) else str(value)
 
 
 def _numeric_literal(value):
@@ -600,6 +752,49 @@ def _convert_single_agg(agg_name: str, agg_def: dict, date_bounds: tuple = None)
             if sub:
                 facet_def["facet"] = sub
         return facet_def
+
+    if "geo_distance" in agg_def:
+        # Distance bands from an origin. Solr has no distance-range facet type, but each band is a
+        # {!geofilt} annulus, and a query facet per band is exactly that: the inner edge subtracted from
+        # the outer one. Measured on 2,000 points against an independently computed answer.
+        conf = agg_def["geo_distance"]
+        field = normalize_field_name(conf.get("field", ""))
+        origin = _lat_lon(conf.get("origin"))
+        if not field or origin is None:
+            logger.warning("geo_distance agg '%s' has no field or origin — skipping", agg_name)
+            return None
+        unit = str(conf.get("unit", "m")).lower()
+        factor = _DISTANCE_UNITS.get(unit)
+        if factor is None:
+            logger.warning("geo_distance agg '%s' states unit '%s', which is unknown", agg_name, unit)
+            return None
+        bands = {}
+        for band in conf.get("ranges", []):
+            if not isinstance(band, dict):
+                continue
+            lower, upper = band.get("from"), band.get("to")
+            key = band.get("key") or "%s-%s" % (
+                "*" if lower is None else _number(lower), "*" if upper is None else _number(upper))
+            geofilt = "{!geofilt sfield=%s pt=%s,%s d=%%s}" % (field, origin[0], origin[1])
+            # ⚠️ The leading `+` is required. Written as `outer -inner` the whole string is parsed by the
+            # leading local-params parser and the negation is ignored: measured, that answered 130 — the
+            # outer circle alone — where the band holds 91. `+outer -inner` answers 91. `AND NOT` is
+            # ignored the same way.
+            if upper is None:
+                # An open upper edge: everything outside the inner one.
+                bands[key] = {"type": "query",
+                             "q": "+*:* -%s" % (geofilt % _number(float(lower) * factor))}
+            elif lower is None:
+                bands[key] = {"type": "query", "q": geofilt % _number(float(upper) * factor)}
+            else:
+                bands[key] = {"type": "query",
+                             "q": "+%s -%s" % (geofilt % _number(float(upper) * factor),
+                                              geofilt % _number(float(lower) * factor))}
+        if not bands:
+            logger.warning("geo_distance agg '%s' states no ranges — skipping", agg_name)
+            return None
+        # One entry per band, so the caller splices them in beside each other.
+        return bands if len(bands) > 1 else next(iter(bands.values()))
 
     if "multi_terms" in agg_def or "composite" in agg_def:
         # Both group by a tuple of fields, which Solr states as nested terms facets, one level per

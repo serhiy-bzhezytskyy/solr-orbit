@@ -1267,7 +1267,14 @@ def _prepare_document(doc, integer_fields=None):
     for key, value in list(doc.items()):
         if isinstance(value, list) and len(value) == 2:
             if all(isinstance(v, (int, float)) for v in value):
+                # ⚠️ [lon, lat] — GeoJSON order — becomes the "lat,lon" a Solr spatial field takes.
                 doc[key] = f"{value[1]},{value[0]}"
+                # ⭐ And the components, because a point-in-polygon filter needs them as numbers. Solr
+                # cannot take a WKT POLYGON without JTS, and a convex ring is the intersection of its
+                # edges' half-planes — which {!frange} states over lat and lon. A nested corpus like
+                # noaa's already yields these from flattening; a flat [lon, lat] pair does not.
+                doc["%s_lat" % key] = value[1]
+                doc["%s_lon" % key] = value[0]
         elif isinstance(value, str) and len(value) == 19 and value[10] in (' ', 'T'):
             # A timestamp with no zone. OpenSearch reads it as UTC; Solr's date field requires the zone
             # and rejects the value outright, so every document would fail.

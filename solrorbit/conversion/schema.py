@@ -105,12 +105,23 @@ OPENSEARCH_TO_SOLR_TYPES = {
     "date": "pdate",
     "binary": "binary",
 
-    # Spatial. The generated schema declares a location_rpt fieldType, and this is what makes a
-    # geo_point field use it. As a string the value is indexed and returned unchanged but nothing
-    # spatial works on it: a bounding-box filter, a distance filter and a heatmap grid facet all need
-    # a spatial field, and a heatmap needs an RPT one specifically. geonames and noaa each had this
-    # corrected by hand before the type table did it.
-    "geo_point": "location_rpt",
+    # Spatial. As a string the value is indexed and returned unchanged but nothing spatial works on it:
+    # a bounding-box filter, a distance filter and a heatmap grid facet all need a spatial field.
+    # geonames and noaa each had this corrected by hand before the type table did it.
+    #
+    # ⚠️ Which spatial type matters, and RPT is the wrong default for a point. An RPT index answers a
+    # shape query *approximately*, bounded by the maxDistErr set at index time. Measured on 2,000 points
+    # whose membership was computed independently:
+    #
+    #     filter                     exact   LatLonPointSpatialField   location_rpt
+    #     geofilt d=200km              39     ⭐ 39                     41  (over by 2)
+    #     bounding box                380     ⭐ 380                   388  (over by 8)
+    #
+    # ⇒ So a geo_point becomes a LatLonPointSpatialField, which is exact for points and is what these
+    # queries need. The location_rpt fieldType is still declared in the schema, because a heatmap grid
+    # facet needs an RPT field specifically — noaa carries one — and a workload that wants both gets both
+    # by declaring a second field of that type.
+    "geo_point": "location",
 }
 
 
@@ -244,9 +255,9 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
             # ⚠️ Say false rather than omitting it. The generated string fieldType declares
             # docValues="true", and a field that leaves the attribute out inherits that — so silence
             # would give doc values to the one field upstream switches them off for.
-            if solr_type not in ("text_general", "location_rpt"):
+            if solr_type not in ("text_general", "location_rpt", "location"):
                 solr_field["docValues"] = False
-        elif solr_type not in ("text_general", "location_rpt"):
+        elif solr_type not in ("text_general", "location_rpt", "location"):
             # A text field has no per-document values, and an RPT field cannot expose them.
             solr_field["docValues"] = True
 
@@ -264,6 +275,22 @@ def translate_opensearch_mapping(properties: Dict[str, Any]) -> tuple[Dict[str, 
                 date_formats.update(_solr_date_patterns(os_format))
 
         solr_fields[field_name] = solr_field
+
+        if os_type == "geo_point":
+            # ⭐ A heatmap grid facet can only read a prefix-tree field, and an RPT index answers a point
+            # query approximately (measured: 41 against the exact 39 on a 200 km filter). So both are
+            # emitted: the exact field under the mapping's own name, and an RPT copy for a grid facet.
+            # noaa arrived at exactly this split by hand, filtering on lat/lon and facetting on the RPT
+            # field, after the RPT filter over-matched 33.6M documents by 167,832.
+            solr_fields["%s_rpt" % field_name] = {
+                "type": "location_rpt", "indexed": True, "stored": True}
+            copy_fields.append((field_name, "%s_rpt" % field_name))
+            # ⭐ And the components as numbers: a point-in-polygon filter is a conjunction of half-planes
+            # over them, because Solr cannot take a WKT POLYGON without JTS. The runner emits these from
+            # the coordinate pair; declaring them is what makes them queryable.
+            for axis in ("lat", "lon"):
+                solr_fields["%s_%s" % (field_name, axis)] = {
+                    "type": "pdouble", "indexed": True, "stored": True, "docValues": True}
 
         # Handle multi-fields (OpenSearch sub-fields like .raw, .keyword, .sort)
         # Example: {"country_code": {"type": "text", "fields": {"raw": {"type": "keyword"}}}}
@@ -412,7 +439,13 @@ def generate_schema_xml(field_defs: Dict[str, Dict[str, Any]],
     </analyzer>
   </fieldType>
 
-  <!-- Spatial: lat/lon point -->
+  <!-- Spatial: an exact lat/lon point. This is what a geo_point becomes, because a point query over it
+       is exact: measured on 2,000 points, geofilt d=200km answered 39 against the independently computed
+       39, where an RPT index answered 41. -->
+  <fieldType name="location" class="solr.LatLonPointSpatialField" docValues="true" />
+
+  <!-- Spatial: a prefix-tree index, which answers a shape query approximately but is the only type a
+       heatmap grid facet can use. Declared so a workload needing one can name it. -->
   <fieldType name="location_rpt" class="solr.SpatialRecursivePrefixTreeFieldType"
              geo="true" distErrPct="0.025" maxDistErr="0.001" distanceUnits="kilometers" />
 

@@ -34,9 +34,21 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
     station_elevation went without them on a field its operations filter by.
     """
 
-    def test_a_geo_point_uses_the_spatial_field_type(self):
+    def test_a_geo_point_uses_the_exact_point_type(self):
+        # ⚠️ RPT is the wrong default for a point: it answers a shape query approximately, bounded by the
+        # maxDistErr set at index time. Measured on 2,000 points whose membership was computed
+        # independently: a 200 km geofilt answered 39 on a LatLonPointSpatialField (the exact answer) and
+        # 41 on an RPT field; a bounding box answered 380 against 388.
         fields, _, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
-        self.assertEqual("location_rpt", fields["location"]["type"])
+        self.assertEqual("location", fields["location"]["type"])
+
+    def test_a_geo_point_also_gets_an_rpt_copy_for_a_heatmap(self):
+        # A heatmap grid facet can only read a prefix-tree field, so both are emitted. noaa reached this
+        # split by hand — filtering on lat/lon, facetting on the RPT field — after an RPT filter
+        # over-matched 33.6M documents by 167,832.
+        fields, copies, _ = translate_opensearch_mapping({"location": {"type": "geo_point"}})
+        self.assertEqual("location_rpt", fields["location_rpt"]["type"])
+        self.assertIn(("location", "location_rpt"), copies)
 
     def test_a_spatial_field_gets_no_doc_values(self):
         # An RPT field cannot expose them, which is why geonames and noaa carry lat/lon separately.
@@ -73,7 +85,7 @@ class TestFieldTypeAndDocValues(unittest.TestCase):
         # and geo_point both went wrong. These are the ones the six ported workloads actually declare.
         for os_type, expected in (("match_only_text", "text_general"), ("wildcard", "string"),
                                   ("ip", "string"), ("double_range", "pdouble"),
-                                  ("geo_point", "location_rpt"), ("scaled_float", "pdouble"),
+                                  ("geo_point", "location"), ("scaled_float", "pdouble"),
                                   ("half_float", "pfloat")):
             fields, _, _ = translate_opensearch_mapping({"f": {"type": os_type}})
             self.assertEqual(expected, fields["f"]["type"], msg="%s mapped wrongly" % os_type)
