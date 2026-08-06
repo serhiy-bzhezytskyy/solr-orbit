@@ -1406,7 +1406,12 @@ def _flatten_document(doc, prefix="", separator="_"):
 _FRACTIONAL = re.compile(r"^-?\d+\.\d+$")
 
 # A WKT point, whose coordinates are longitude then latitude.
-_WKT_POINT = re.compile(r"^\s*POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)\s*$",
+# ⚠️ The exponent is not optional decoration: geopointshape's corpus writes a coordinate near zero as
+# "POINT (-3.4e-06 51.5926465)". Without it 993 of 60,844,404 documents carried no lat/lon components, and
+# a half-plane polygon filter — which reads those components — undercounted by 882 while the field itself
+# still answered a geofilt. A number, not an error.
+_WKT_NUMBER = r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+_WKT_POINT = re.compile(r"^\s*POINT\s*\(\s*(%s)\s+(%s)\s*\)\s*$" % (_WKT_NUMBER, _WKT_NUMBER),
                         re.IGNORECASE)
 
 # Solr field types with no fractional part. A field of one of these rejects "800.94".

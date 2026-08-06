@@ -862,6 +862,21 @@ class TestCoordinatePairComponents(unittest.TestCase):
         # The value itself is left as written, since Solr parses it.
         self.assertEqual("POINT (-0.1485188 51.5250666)", doc["location"])
 
+    def test_a_wkt_coordinate_in_exponent_form_is_read(self):
+        # ⛔ Measured on the loaded corpus: 993 of geopointshape's 60,844,404 documents write a coordinate
+        # near zero as "POINT (-3.4e-06 51.5926465)". A regex accepting only plain decimals left those
+        # documents with no components, and the half-plane polygon filter — which reads the components —
+        # undercounted by 882 while the point field itself still answered a geofilt. Silent, and plausible.
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "location": "POINT (-3.4e-06 51.5926465)"})
+        self.assertEqual(51.5926465, doc["location_lat"])
+        self.assertEqual(-3.4e-06, doc["location_lon"])
+
+    def test_an_exponent_without_a_sign_is_read_as_well(self):
+        from solrorbit.worker_coordinator.runner import _prepare_document
+        doc = _prepare_document({"id": "1", "location": "POINT (4.11E-05 51.6154661)"})
+        self.assertEqual(4.11e-05, doc["location_lon"])
+
     def test_a_string_merely_starting_with_point_is_left_alone(self):
         from solrorbit.worker_coordinator.runner import _prepare_document
         doc = _prepare_document({"id": "1", "name": "POINTER"})
